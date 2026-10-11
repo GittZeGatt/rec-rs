@@ -13,11 +13,13 @@ use crate::compose::{Compositor, PipSpec};
 use crate::screen::{self, ScreenCapture, ScreenConfig};
 use crate::tcc::{self, Status};
 use crate::util::*;
-use crate::writer::{AudioLayout, Codec, Sink, Stats, VideoSpec};
+use crate::writer::{AudioLayout, Codec, PreviewFn, Sink, Stats, VideoSpec};
 
 pub struct Shared {
     pub sink: Mutex<Option<Sink>>,
     pub error: Mutex<Option<String>>,
+    /// Set when the session must end (error from a capture source/writer).
+    pub stop: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -31,10 +33,11 @@ impl Shared {
         if e.is_none() {
             *e = Some(msg);
         }
-        STOP.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
+/// Set by SIGINT/SIGTERM/SIGHUP in CLI mode.
 static STOP: AtomicBool = AtomicBool::new(false);
 static SIGNALS: AtomicI32 = AtomicI32::new(0);
 
@@ -96,103 +99,205 @@ pub fn check_permissions(o: &Options) -> Result<()> {
     Ok(())
 }
 
-pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
-    let (w, h) = o.size;
-    let pixel_format = if o.webcam.is_some() { PIX_BGRA } else { PIX_420V };
-    let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
-    let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
-    let sink = Sink::new(&o.output, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor)?;
-    let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None) });
+/// A running capture session: recording to a file, or preview-only.
+pub struct Session {
+    shared: Arc<Shared>,
+    stop: Arc<AtomicBool>,
+    pacer: Option<std::thread::JoinHandle<()>>,
+    screen: Option<ScreenCapture>,
+    synth: Option<Synth>,
+    cam: Option<Camera>,
+    av_mic: Option<Mic>,
+    pub output: Option<PathBuf>,
+    pub started: Instant,
+    pub description: String,
+}
 
+impl Session {
+    /// Start capturing. `write` false = preview-only (nothing written).
+    pub fn start(o: &Options, target: Option<screen::Target>, write: bool, preview: Option<PreviewFn>) -> Result<Session> {
+        let (w, h) = o.size;
+        let pixel_format = if o.webcam.is_some() { PIX_BGRA } else { PIX_420V };
+        let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
+        let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
+        let path = write.then_some(o.output.as_path());
+        let sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, preview)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None), stop: stop.clone() });
+        let mut sess = Session {
+            shared: shared.clone(),
+            stop: stop.clone(),
+            pacer: None,
+            screen: None,
+            synth: None,
+            cam: None,
+            av_mic: None,
+            output: write.then(|| o.output.clone()),
+            started: Instant::now(),
+            description: String::new(),
+        };
+        // On any start failure, tear down what was started and remove the file.
+        match sess.start_sources(o, target, pixel_format) {
+            Ok(()) => {}
+            Err(e) => {
+                sess.stop_sources();
+                if let Some(s) = shared.sink.lock().unwrap().take() {
+                    let _ = s.finish(0.0);
+                }
+                if write {
+                    let _ = std::fs::remove_file(&o.output);
+                }
+                return Err(e);
+            }
+        }
+        // Pacer: emit constant-frame-rate video a little behind real time.
+        let pacer_shared = shared.clone();
+        let pacer_stop = stop.clone();
+        let fps = o.fps;
+        sess.pacer = Some(std::thread::spawn(move || {
+            let period = Duration::from_secs_f64(1.0 / fps as f64 / 2.0);
+            while !pacer_stop.load(Ordering::SeqCst) {
+                let now = secs(host_now());
+                // Plain threads have no autorelease pool; without one every
+                // autoreleased CoreImage/AVFoundation object would leak.
+                objc2::rc::autoreleasepool(|_| {
+                    let mut failure = None;
+                    pacer_shared.with(|s| {
+                        s.emit_until(now - s.lag());
+                        failure = s.failure().map(str::to_string);
+                    });
+                    if let Some(f) = failure {
+                        pacer_shared.fail(format!("writer failed: {f}"));
+                    }
+                });
+                std::thread::sleep(period);
+            }
+        }));
+        sess.started = Instant::now();
+        Ok(sess)
+    }
+
+    fn start_sources(&mut self, o: &Options, target: Option<screen::Target>, pixel_format: u32) -> Result<()> {
+        let (w, h) = o.size;
+        if let Some(sel) = &o.webcam {
+            self.cam = Some(Camera::start(sel.as_deref(), self.shared.clone())?);
+        }
+        let sck_mic = if o.mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
+        if o.mic_backend == MicBackend::Avcapture
+            && let Some(sel) = &o.mic
+        {
+            self.av_mic = Some(Mic::start(sel.as_deref(), self.shared.clone())?);
+        }
+        match (o.test_pattern, target) {
+            (Some(noise), _) => {
+                self.synth = Some(Synth::start(w, h, o.fps, pixel_format, noise, self.shared.clone()));
+                self.description = format!("test pattern{}", if noise { " (noise)" } else { "" });
+            }
+            (None, Some(target)) => {
+                self.description = target.describe();
+                let cfg = ScreenConfig {
+                    target,
+                    width: w,
+                    height: h,
+                    fps: o.fps,
+                    pixel_format,
+                    cursor: o.cursor,
+                    clicks: o.clicks,
+                    system_audio: o.system_audio,
+                    mic: sck_mic,
+                };
+                self.screen = Some(ScreenCapture::start(&cfg, self.shared.clone())?);
+            }
+            (None, None) => bail!("internal: no capture target"),
+        }
+        Ok(())
+    }
+
+    fn stop_sources(&mut self) -> Option<anyhow::Error> {
+        let err = self.screen.take().and_then(|s| s.stop().err());
+        if let Some(mut s) = self.synth.take() {
+            s.stop();
+        }
+        if let Some(c) = self.cam.take() {
+            c.stop();
+        }
+        if let Some(m) = self.av_mic.take() {
+            m.stop();
+        }
+        err
+    }
+
+    pub fn camera_name(&self) -> Option<&str> {
+        self.cam.as_ref().map(|c| c.name.as_str())
+    }
+
+    /// True once a source or the writer failed (see `error`).
+    pub fn failed(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.shared.error.lock().unwrap().clone()
+    }
+
+    pub fn has_frames(&self) -> bool {
+        let mut ok = false;
+        self.shared.with(|s| ok = s.started());
+        ok
+    }
+
+    /// (stats, peak levels [system, mic] since last call).
+    pub fn poll(&self) -> (Stats, [f32; 2]) {
+        let mut st = Stats::default();
+        let mut lv = [0f32; 2];
+        self.shared.with(|s| {
+            st = s.stats.clone();
+            lv = s.take_levels();
+        });
+        (st, lv)
+    }
+
+    /// Stop capture and finalize the file (if any). Blocks until written.
+    pub fn finish(mut self) -> Result<Stats> {
+        let end = secs(host_now());
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(p) = self.pacer.take() {
+            let _ = p.join();
+        }
+        let stop_err = self.stop_sources();
+        let sink = self.shared.sink.lock().unwrap().take();
+        let result = match sink {
+            Some(s) => objc2::rc::autoreleasepool(|_| s.finish(end)),
+            None => bail!("internal: sink missing"),
+        };
+        if let Some(e) = self.shared.error.lock().unwrap().take() {
+            eprintln!("rec: error during recording: {e}");
+        }
+        if let Some(e) = stop_err {
+            eprintln!("rec: warning: stopping screen capture: {e}");
+        }
+        result
+    }
+}
+
+/// CLI recording: run until Ctrl-C/SIGTERM, `rec stop`, duration, or error.
+pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as usize);
         libc::signal(libc::SIGTERM, on_signal as *const () as usize);
         libc::signal(libc::SIGHUP, on_signal as *const () as usize);
     }
-
-    let cleanup_partial = |shared: &Arc<Shared>| {
-        if let Some(s) = shared.sink.lock().unwrap().take() {
-            let _ = s.finish(0.0);
-        }
-        let _ = std::fs::remove_file(&o.output);
-    };
-
-    let cam = match &o.webcam {
-        Some(sel) => match Camera::start(sel.as_deref(), shared.clone()) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                cleanup_partial(&shared);
-                return Err(e);
-            }
-        },
-        None => None,
-    };
     let mic_desc = match &o.mic {
         None => "off".to_string(),
         Some(None) => "default".to_string(),
-        Some(Some(id)) => camera::microphones()
-            .into_iter()
-            .find(|m| &m.id == id)
-            .map(|m| m.name)
-            .unwrap_or(id.clone()),
+        Some(Some(id)) => camera::microphones().into_iter().find(|m| &m.id == id).map(|m| m.name).unwrap_or(id.clone()),
     };
-    let sck_mic = if o.mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
-    let mut av_mic = None;
-    if o.mic_backend == MicBackend::Avcapture
-        && let Some(sel) = &o.mic {
-            match Mic::start(sel.as_deref(), shared.clone()) {
-                Ok(m) => av_mic = Some(m),
-                Err(e) => {
-                    if let Some(c) = &cam {
-                        c.stop();
-                    }
-                    cleanup_partial(&shared);
-                    return Err(e);
-                }
-            }
-        }
-    let mut synth = None;
-    let mut screen = None;
-    let source_desc;
-    match (o.test_pattern, target) {
-        (Some(noise), _) => {
-            synth = Some(Synth::start(w, h, o.fps, pixel_format, noise, shared.clone()));
-            source_desc = format!("test pattern{}", if noise { " (noise)" } else { "" });
-        }
-        (None, Some(target)) => {
-            source_desc = target.describe();
-            let cfg = ScreenConfig {
-                target,
-                width: w,
-                height: h,
-                fps: o.fps,
-                pixel_format,
-                cursor: o.cursor,
-                clicks: o.clicks,
-                system_audio: o.system_audio,
-                mic: sck_mic,
-            };
-            match ScreenCapture::start(&cfg, shared.clone()) {
-                Ok(s) => screen = Some(s),
-                Err(e) => {
-                    if let Some(c) = &cam {
-                        c.stop();
-                    }
-                    if let Some(m) = &av_mic {
-                        m.stop();
-                    }
-                    cleanup_partial(&shared);
-                    return Err(e);
-                }
-            }
-        }
-        (None, None) => bail!("internal: no capture target"),
-    }
-
+    let sess = Session::start(&o, target, true, None)?;
+    let (w, h) = o.size;
     if !o.quiet {
         eprintln!(
             "rec: recording {} -> {} ({}x{} @ {}fps {:?}{}, system audio {}, mic {}, webcam {})",
-            source_desc,
+            sess.description,
             o.output.display(),
             w,
             h,
@@ -201,68 +306,34 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
             if o.codec == Codec::Prores { String::new() } else { format!(" {} Mb/s", o.bitrate / 1_000_000) },
             if o.system_audio { "on" } else { "off" },
             mic_desc,
-            cam.as_ref().map(|c| c.name.as_str()).unwrap_or("off"),
+            sess.camera_name().unwrap_or("off"),
         );
         eprintln!("rec: press Ctrl-C to stop");
     }
 
-    // Pacer: emit constant-frame-rate video a little behind real time.
-    let pacer_shared = shared.clone();
-    let fps = o.fps;
-    let pacer = std::thread::spawn(move || {
-        let period = Duration::from_secs_f64(1.0 / fps as f64 / 2.0);
-        while !STOP.load(Ordering::SeqCst) {
-            let now = secs(host_now());
-            // Plain threads have no autorelease pool; without one every
-            // autoreleased CoreImage/AVFoundation object would leak.
-            objc2::rc::autoreleasepool(|_| {
-                pacer_shared.with(|s| {
-                    s.emit_until(now - s.lag());
-                    if let Some(f) = s.failure() {
-                        let f = f.to_string();
-                        let ps = pacer_shared.clone();
-                        std::thread::spawn(move || ps.fail(format!("writer failed: {f}")));
-                    }
-                });
-            });
-            std::thread::sleep(period);
-        }
-    });
-
     let pidfile = pidfile_path();
     let _ = std::fs::write(&pidfile, format!("{}\n{}\n", std::process::id(), o.output.display()));
 
-    let started = Instant::now();
     let mut last_status = Instant::now();
     let mut warned_no_frames = false;
-    while !STOP.load(Ordering::SeqCst) {
+    while !STOP.load(Ordering::SeqCst) && !sess.failed() {
         std::thread::sleep(Duration::from_millis(20));
-        let el = started.elapsed().as_secs_f64();
+        let el = sess.started.elapsed().as_secs_f64();
         if let Some(d) = o.duration
-            && el >= d {
-                break;
-            }
-        if !warned_no_frames && el > 3.0 {
-            let mut started_ok = true;
-            shared.with(|s| started_ok = s.started());
-            if !started_ok {
-                warned_no_frames = true;
-                eprintln!("rec: warning: no screen frames after 3s (is Screen Recording permission granted?)");
-            }
+            && el >= d
+        {
+            break;
+        }
+        if !warned_no_frames && el > 3.0 && !sess.has_frames() {
+            warned_no_frames = true;
+            eprintln!("rec: warning: no screen frames after 3s (is Screen Recording permission granted?)");
         }
         if !o.quiet && last_status.elapsed() >= Duration::from_secs(1) {
             last_status = Instant::now();
-            let mut st = Stats::default();
-            let mut lv = [0f32; 2];
-            shared.with(|s| {
-                st = s.stats.clone();
-                lv = s.take_levels();
-            });
-            let db = |p: f32| if p <= 1e-5 { "  -inf".to_string() } else { format!("{:>6.1}", 20.0 * p.log10()) };
+            let (st, lv) = sess.poll();
             eprint!(
-                "\r\x1b[2K  {:02}:{:02}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB  ",
-                el as u64 / 60,
-                el as u64 % 60,
+                "\r\x1b[2K  {}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB  ",
+                clock(el),
                 st.video_frames_out,
                 st.video_dups,
                 st.video_drops,
@@ -271,35 +342,21 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
             );
         }
     }
-    let end = secs(host_now());
-    STOP.store(true, Ordering::SeqCst);
     if !o.quiet {
         eprintln!("\nrec: stopping...");
     }
-    let _ = pacer.join();
-    let stop_err = screen.as_ref().and_then(|s| s.stop().err());
-    if let Some(s) = synth.as_mut() {
-        s.stop();
-    }
-    if let Some(c) = &cam {
-        c.stop();
-    }
-    if let Some(m) = &av_mic {
-        m.stop();
-    }
-    let sink = shared.sink.lock().unwrap().take();
-    let result = match sink {
-        Some(s) => objc2::rc::autoreleasepool(|_| s.finish(end)),
-        None => bail!("internal: sink missing"),
-    };
+    let result = sess.finish();
     let _ = std::fs::remove_file(&pidfile);
-    if let Some(e) = shared.error.lock().unwrap().take() {
-        eprintln!("rec: error during recording: {e}");
-    }
-    if let Some(e) = stop_err {
-        eprintln!("rec: warning: stopping screen capture: {e}");
-    }
     result
+}
+
+pub fn clock(secs: f64) -> String {
+    let s = secs as u64;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{:02}:{:02}", s / 60, s % 60) }
+}
+
+pub fn db(p: f32) -> String {
+    if p <= 1e-5 { "  -inf".to_string() } else { format!("{:>6.1}", 20.0 * p.log10()) }
 }
 
 pub fn pidfile_path() -> PathBuf {

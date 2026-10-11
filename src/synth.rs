@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use objc2_core_foundation::{CFDictionary, CFRetained};
+use objc2_core_foundation::CFRetained;
 use objc2_core_video::*;
 
 use crate::record::Shared;
@@ -15,21 +15,6 @@ use crate::util::*;
 pub struct Synth {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-}
-
-fn make_pool(w: usize, h: usize, pix: u32) -> CFRetained<CVPixelBufferPool> {
-    let attrs = dict(vec![
-        (cf_ns(unsafe { kCVPixelBufferPixelFormatTypeKey }), num_i(pix as i64)),
-        (cf_ns(unsafe { kCVPixelBufferWidthKey }), num_i(w as i64)),
-        (cf_ns(unsafe { kCVPixelBufferHeightKey }), num_i(h as i64)),
-        (cf_ns(unsafe { kCVPixelBufferIOSurfacePropertiesKey }), obj(&*dict(vec![]))),
-    ]);
-    let attrs_cf: &CFDictionary = unsafe { &*(&*attrs as *const Dict as *const CFDictionary) };
-    let mut pool = std::ptr::null_mut();
-    unsafe {
-        CVPixelBufferPool::create(None, None, Some(attrs_cf), std::ptr::NonNull::from(&mut pool));
-        CFRetained::from_raw(std::ptr::NonNull::new(pool).expect("pixel buffer pool"))
-    }
 }
 
 struct Rng(u64);

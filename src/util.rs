@@ -55,3 +55,20 @@ pub const fn fourcc(s: &[u8; 4]) -> u32 {
 }
 pub const PIX_420V: u32 = fourcc(b"420v");
 pub const PIX_BGRA: u32 = fourcc(b"BGRA");
+
+pub fn make_pool(w: usize, h: usize, pix: u32) -> objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBufferPool> {
+    let attrs = dict(vec![
+        (cf_ns(unsafe { objc2_core_video::kCVPixelBufferPixelFormatTypeKey }), num_i(pix as i64)),
+        (cf_ns(unsafe { objc2_core_video::kCVPixelBufferWidthKey }), num_i(w as i64)),
+        (cf_ns(unsafe { objc2_core_video::kCVPixelBufferHeightKey }), num_i(h as i64)),
+        (cf_ns(unsafe { objc2_core_video::kCVPixelBufferIOSurfacePropertiesKey }), obj(&*dict(vec![]))),
+    ]);
+    let attrs_cf: &objc2_core_foundation::CFDictionary =
+        unsafe { &*(&*attrs as *const Dict as *const objc2_core_foundation::CFDictionary) };
+    let mut pool = std::ptr::null_mut();
+    unsafe {
+        objc2_core_video::CVPixelBufferPool::create(None, None, Some(attrs_cf), std::ptr::NonNull::from(&mut pool));
+        objc2_core_foundation::CFRetained::from_raw(std::ptr::NonNull::new(pool).expect("pixel buffer pool"))
+    }
+}
+

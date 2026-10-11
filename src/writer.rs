@@ -88,13 +88,25 @@ pub struct Stats {
 
 type Pb = SendBox<CFRetained<CVPixelBuffer>>;
 
-pub struct Sink {
+/// Receives every emitted (composited) video frame, throttled to ~30 fps.
+pub type PreviewFn = std::sync::Arc<dyn Fn(CFRetained<CVPixelBuffer>) + Send + Sync>;
+
+/// The file being written (absent for preview-only sessions).
+struct Out {
     writer: Retained<AVAssetWriter>,
     video: Retained<AVAssetWriterInput>,
     adaptor: Retained<AVAssetWriterInputPixelBufferAdaptor>,
     sys: Option<Retained<AVAssetWriterInput>>,
     mic: Option<Retained<AVAssetWriterInput>>,
     mix_input: Option<Retained<AVAssetWriterInput>>,
+}
+
+pub struct Sink {
+    out: Option<Out>,
+    /// Compositor output pool when there is no writer adaptor pool.
+    own_pool: Option<CFRetained<CVPixelBufferPool>>,
+    preview: Option<PreviewFn>,
+    last_preview: f64,
     mixer: Option<Mixer>,
     mix_cfg: ([bool; 2], [f32; 2]),
     fps: i64,
@@ -166,121 +178,46 @@ fn audio_settings(channels: i64, bitrate: i64) -> Retained<Dict> {
 }
 
 impl Sink {
+    /// `path` None = preview-only session (nothing is written).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        path: &Path,
+        path: Option<&Path>,
         v: &VideoSpec,
         system_audio: bool,
         mic: bool,
         layout: AudioLayout,
         gains_db: [f32; 2],
         compositor: Option<Compositor>,
+        preview: Option<PreviewFn>,
     ) -> Result<Self> {
-        if path.exists() {
-            bail!("{} already exists", path.display());
-        }
-        let abs = std::path::absolute(path)?;
-        let file_type = match path.extension().and_then(|e| e.to_str()) {
-            Some("mp4") | Some("m4v") => unsafe { AVFileTypeMPEG4 }.unwrap(),
-            _ => unsafe { AVFileTypeQuickTimeMovie }.unwrap(),
+        let out = match path {
+            Some(p) => Some(open_output(p, v, system_audio, mic, layout)?),
+            None => None,
         };
-        unsafe {
-            let url = NSURL::fileURLWithPath(&ns(abs.to_str().context("non-UTF8 path")?));
-            let writer = AVAssetWriter::initWithURL_fileType_error(AVAssetWriter::alloc(), &url, file_type)
-                .map_err(|e| anyhow!("AVAssetWriter: {}", e.localizedDescription()))?;
-            // Fragmented writing: a crash or power loss leaves a playable file
-            // up to the last fragment instead of an unreadable one.
-            writer.setMovieFragmentInterval(CMTime::new(5 * TIMESCALE as i64, TIMESCALE));
-
-            let media_video = AVMediaTypeVideo.unwrap();
-            let video = AVAssetWriterInput::initWithMediaType_outputSettings(
-                AVAssetWriterInput::alloc(),
-                media_video,
-                Some(&video_settings(v)),
-            );
-            video.setExpectsMediaDataInRealTime(true);
-            video.setMediaTimeScale(TIMESCALE);
-            let attrs = dict(vec![
-                (cf_ns(kCVPixelBufferPixelFormatTypeKey), num_i(v.pixel_format as i64)),
-                (cf_ns(kCVPixelBufferWidthKey), num_i(v.width as i64)),
-                (cf_ns(kCVPixelBufferHeightKey), num_i(v.height as i64)),
-                (cf_ns(kCVPixelBufferIOSurfacePropertiesKey), obj(&*dict(vec![]))),
-            ]);
-            let adaptor = AVAssetWriterInputPixelBufferAdaptor::initWithAssetWriterInput_sourcePixelBufferAttributes(
-                AVAssetWriterInputPixelBufferAdaptor::alloc(),
-                &video,
-                Some(&attrs),
-            );
-            if !writer.canAddInput(&video) {
-                bail!("cannot add video input (unsupported codec/size {}x{}?)", v.width, v.height);
-            }
-            writer.addInput(&video);
-
-            let media_audio = AVMediaTypeAudio.unwrap();
-            let mk_audio = |ch: i64, br: i64| -> Result<Retained<AVAssetWriterInput>> {
-                let a = AVAssetWriterInput::initWithMediaType_outputSettings(
-                    AVAssetWriterInput::alloc(),
-                    media_audio,
-                    Some(&audio_settings(ch, br)),
-                );
-                a.setExpectsMediaDataInRealTime(true);
-                if !writer.canAddInput(&a) {
-                    bail!("cannot add audio input");
-                }
-                writer.addInput(&a);
-                Ok(a)
-            };
-            // Track order (documented in README): mix, system, mic.
-            let mic_on = mic;
-            let both = system_audio && mic;
-            let want_mix = both && layout != AudioLayout::Stems;
-            let want_stems = !both || layout != AudioLayout::Mix;
-            let mix_input = if want_mix { Some(mk_audio(2, 256_000)?) } else { None };
-            let sys = if system_audio && want_stems { Some(mk_audio(2, 256_000)?) } else { None };
-            let mic = if mic && want_stems { Some(mk_audio(1, 128_000)?) } else { None };
-            if let (Some(mixi), true) = (&mix_input, want_stems) {
-                // One alternate group, mix as default: QuickTime/AVPlayer play
-                // only the mix; editors still see every track.
-                let mut members: Vec<&AVAssetWriterInput> = vec![mixi];
-                members.extend(sys.as_deref());
-                members.extend(mic.as_deref());
-                let arr = objc2_foundation::NSArray::from_slice(&members);
-                let group = AVAssetWriterInputGroup::initWithInputs_defaultInput(
-                    AVAssetWriterInputGroup::alloc(),
-                    &arr,
-                    Some(mixi),
-                );
-                if writer.canAddInputGroup(&group) {
-                    writer.addInputGroup(&group);
-                } else {
-                    bail!("cannot add audio track group");
-                }
-            }
-
-            if !writer.startWriting() {
-                bail!("startWriting failed: {}", err_text(&writer));
-            }
-            Ok(Sink {
-                writer,
-                video,
-                adaptor,
-                sys,
-                mic,
-                mix_input,
-                mixer: None,
-                mix_cfg: ([system_audio, mic_on], gains_db),
-                fps: v.fps as i64,
-                t0: None,
-                next_slot: 0,
-                screen_q: VecDeque::new(),
-                screen_last: None,
-                cam_q: VecDeque::new(),
-                cam_last: None,
-                compositor,
-                stats: Stats::default(),
-                failed: None,
-                levels: [0.0; 2],
-            })
-        }
+        let own_pool = if out.is_none() && compositor.is_some() {
+            Some(make_pool(v.width, v.height, v.pixel_format))
+        } else {
+            None
+        };
+        Ok(Sink {
+            out,
+            own_pool,
+            preview,
+            last_preview: 0.0,
+            mixer: None,
+            mix_cfg: ([system_audio, mic], gains_db),
+            fps: v.fps as i64,
+            t0: None,
+            next_slot: 0,
+            screen_q: VecDeque::new(),
+            screen_last: None,
+            cam_q: VecDeque::new(),
+            cam_last: None,
+            compositor,
+            stats: Stats::default(),
+            failed: None,
+            levels: [0.0; 2],
+        })
     }
 
     /// Peak levels [system, mic] since the last call (linear, 0..1).
@@ -316,11 +253,13 @@ impl Sink {
         self.stats.screen_latency_sum += lat;
         if self.t0.is_none() {
             let t0 = (pts_s * TIMESCALE as f64).round() as i64;
-            unsafe { self.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
             self.t0 = Some(t0);
-            if self.mix_input.is_some() {
-                let (act, g) = self.mix_cfg;
-                self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], g));
+            if let Some(o) = &self.out {
+                unsafe { o.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
+                if o.mix_input.is_some() {
+                    let (act, g) = self.mix_cfg;
+                    self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], g));
+                }
             }
         }
         self.screen_q.push_back((pts_s, SendBox(pb)));
@@ -356,9 +295,10 @@ impl Sink {
             m.push(kind, sb);
             self.drain_mix(false);
         }
+        let Some(o) = &self.out else { return };
         let input = match kind {
-            AudioKind::System => self.sys.as_ref(),
-            AudioKind::Mic => self.mic.as_ref(),
+            AudioKind::System => o.sys.as_ref(),
+            AudioKind::Mic => o.mic.as_ref(),
         };
         let Some(input) = input else { return };
         unsafe {
@@ -375,7 +315,8 @@ impl Sink {
     }
 
     fn drain_mix(&mut self, flush: bool) {
-        let (Some(m), Some(input)) = (self.mixer.as_mut(), self.mix_input.as_ref()) else { return };
+        let Some(input) = self.out.as_ref().and_then(|o| o.mix_input.clone()) else { return };
+        let Some(m) = self.mixer.as_mut() else { return };
         while let Some(buf) = m.pull(flush) {
             unsafe {
                 if input.isReadyForMoreMediaData() && input.appendSampleBuffer(&buf) {
@@ -400,6 +341,23 @@ impl Sink {
         }
     }
 
+    fn new_output_buffer(&self) -> Option<CFRetained<CVPixelBuffer>> {
+        let mut buf = std::ptr::null_mut();
+        unsafe {
+            match (&self.out, &self.own_pool) {
+                (Some(o), _) => {
+                    let pool = o.adaptor.pixelBufferPool()?;
+                    CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf));
+                }
+                (None, Some(pool)) => {
+                    CVPixelBufferPool::create_pixel_buffer(None, pool, std::ptr::NonNull::from(&mut buf));
+                }
+                (None, None) => return None,
+            }
+            std::ptr::NonNull::new(buf).map(|b| CFRetained::from_raw(b))
+        }
+    }
+
     /// Emit every grid slot whose time is at or before `until` (host seconds).
     pub fn emit_until(&mut self, until: f64) {
         if self.t0.is_none() || self.failed.is_some() {
@@ -417,32 +375,27 @@ impl Sink {
             Self::pick(&mut self.cam_q, &mut self.cam_last, slot_t + half);
             let pts = unsafe { CMTime::new(self.slot_ticks(self.next_slot), TIMESCALE) };
             self.next_slot += 1;
-            let Some(screen) = self.screen_last.as_ref() else { continue };
-            unsafe {
-                if !self.video.isReadyForMoreMediaData() {
+            let Some(screen) = self.screen_last.as_ref().map(|s| s.0.clone()) else { continue };
+            if let Some(o) = &self.out
+                && !unsafe { o.video.isReadyForMoreMediaData() }
+            {
+                self.stats.video_drops += 1;
+                self.check_writer();
+                continue;
+            }
+            let frame: CFRetained<CVPixelBuffer> = if self.compositor.is_some() {
+                let Some(buf) = self.new_output_buffer() else {
                     self.stats.video_drops += 1;
-                    self.check_writer();
                     continue;
-                }
-                let out: CFRetained<CVPixelBuffer> = match self.compositor.as_mut() {
-                    Some(c) => {
-                        let Some(pool) = self.adaptor.pixelBufferPool() else {
-                            self.stats.video_drops += 1;
-                            continue;
-                        };
-                        let mut buf = std::ptr::null_mut();
-                        CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf));
-                        let Some(buf) = std::ptr::NonNull::new(buf) else {
-                            self.stats.video_drops += 1;
-                            continue;
-                        };
-                        let buf = CFRetained::from_raw(buf);
-                        c.render(&screen.0, self.cam_last.as_ref().map(|b| &*b.0), &buf);
-                        buf
-                    }
-                    None => screen.0.clone(),
                 };
-                if self.adaptor.appendPixelBuffer_withPresentationTime(&out, pts) {
+                let cam = self.cam_last.as_ref().map(|b| b.0.clone());
+                self.compositor.as_mut().unwrap().render(&screen, cam.as_deref(), &buf);
+                buf
+            } else {
+                screen
+            };
+            if let Some(o) = &self.out {
+                if unsafe { o.adaptor.appendPixelBuffer_withPresentationTime(&frame, pts) } {
                     self.stats.video_frames_out += 1;
                     if !fresh {
                         self.stats.video_dups += 1;
@@ -451,52 +404,144 @@ impl Sink {
                     self.stats.video_drops += 1;
                     self.check_writer();
                 }
+            } else {
+                self.stats.video_frames_out += 1;
+            }
+            if let Some(p) = &self.preview
+                && slot_t - self.last_preview >= 1.0 / 30.0
+            {
+                self.last_preview = slot_t;
+                p(frame);
             }
         }
     }
 
     fn check_writer(&mut self) {
+        let Some(o) = &self.out else { return };
         unsafe {
-            if self.writer.status() == AVAssetWriterStatus::Failed && self.failed.is_none() {
-                self.failed = Some(err_text(&self.writer));
+            if o.writer.status() == AVAssetWriterStatus::Failed && self.failed.is_none() {
+                self.failed = Some(err_text(&o.writer));
             }
         }
     }
 
     /// Flush video up to `end` (host seconds), trim all tracks there, and
-    /// finalize the file. Blocks until the movie is written.
+    /// finalize the file. Blocks until the movie is written. Preview-only
+    /// sessions just return their stats.
     pub fn finish(mut self, end: f64) -> Result<Stats> {
-        let Some(_) = self.t0 else {
-            unsafe { self.writer.cancelWriting() };
+        if self.out.is_none() {
+            return Ok(self.stats.clone());
+        }
+        if self.t0.is_none() {
+            unsafe { self.out.as_ref().unwrap().writer.cancelWriting() };
             bail!("no screen frames were captured, nothing written");
-        };
+        }
+        self.preview = None;
         self.emit_until(end);
         self.drain_mix(true);
+        let end_t = unsafe { CMTime::new(self.slot_ticks(self.next_slot), TIMESCALE) };
+        let o = self.out.as_ref().unwrap();
         unsafe {
-            let end_t = CMTime::new(self.slot_ticks(self.next_slot), TIMESCALE);
-            self.writer.endSessionAtSourceTime(end_t);
-            self.video.markAsFinished();
-            if let Some(a) = &self.sys {
-                a.markAsFinished();
-            }
-            if let Some(a) = &self.mic {
-                a.markAsFinished();
-            }
-            if let Some(a) = &self.mix_input {
+            o.writer.endSessionAtSourceTime(end_t);
+            o.video.markAsFinished();
+            for a in [&o.sys, &o.mic, &o.mix_input].into_iter().flatten() {
                 a.markAsFinished();
             }
             let (tx, rx) = mpsc::channel();
             let block = RcBlock::new(move || {
                 let _ = tx.send(());
             });
-            self.writer.finishWritingWithCompletionHandler(&block);
+            o.writer.finishWritingWithCompletionHandler(&block);
             rx.recv_timeout(Duration::from_secs(60))
                 .context("timed out finalizing movie")?;
-            if self.writer.status() != AVAssetWriterStatus::Completed {
-                bail!("writing failed: {}", err_text(&self.writer));
+            if o.writer.status() != AVAssetWriterStatus::Completed {
+                bail!("writing failed: {}", err_text(&o.writer));
             }
         }
         Ok(self.stats.clone())
+    }
+}
+
+fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout: AudioLayout) -> Result<Out> {
+    if path.exists() {
+        bail!("{} already exists", path.display());
+    }
+    let abs = std::path::absolute(path)?;
+    let file_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("mp4") | Some("m4v") => unsafe { AVFileTypeMPEG4 }.unwrap(),
+        _ => unsafe { AVFileTypeQuickTimeMovie }.unwrap(),
+    };
+    unsafe {
+        let url = NSURL::fileURLWithPath(&ns(abs.to_str().context("non-UTF8 path")?));
+        let writer = AVAssetWriter::initWithURL_fileType_error(AVAssetWriter::alloc(), &url, file_type)
+            .map_err(|e| anyhow!("AVAssetWriter: {}", e.localizedDescription()))?;
+        // Fragmented writing: a crash or power loss leaves a playable file
+        // up to the last fragment instead of an unreadable one.
+        writer.setMovieFragmentInterval(CMTime::new(5 * TIMESCALE as i64, TIMESCALE));
+
+        let video = AVAssetWriterInput::initWithMediaType_outputSettings(
+            AVAssetWriterInput::alloc(),
+            AVMediaTypeVideo.unwrap(),
+            Some(&video_settings(v)),
+        );
+        video.setExpectsMediaDataInRealTime(true);
+        video.setMediaTimeScale(TIMESCALE);
+        let attrs = dict(vec![
+            (cf_ns(kCVPixelBufferPixelFormatTypeKey), num_i(v.pixel_format as i64)),
+            (cf_ns(kCVPixelBufferWidthKey), num_i(v.width as i64)),
+            (cf_ns(kCVPixelBufferHeightKey), num_i(v.height as i64)),
+            (cf_ns(kCVPixelBufferIOSurfacePropertiesKey), obj(&*dict(vec![]))),
+        ]);
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor::initWithAssetWriterInput_sourcePixelBufferAttributes(
+            AVAssetWriterInputPixelBufferAdaptor::alloc(),
+            &video,
+            Some(&attrs),
+        );
+        if !writer.canAddInput(&video) {
+            bail!("cannot add video input (unsupported codec/size {}x{}?)", v.width, v.height);
+        }
+        writer.addInput(&video);
+
+        let media_audio = AVMediaTypeAudio.unwrap();
+        let mk_audio = |ch: i64, br: i64| -> Result<Retained<AVAssetWriterInput>> {
+            let a = AVAssetWriterInput::initWithMediaType_outputSettings(
+                AVAssetWriterInput::alloc(),
+                media_audio,
+                Some(&audio_settings(ch, br)),
+            );
+            a.setExpectsMediaDataInRealTime(true);
+            if !writer.canAddInput(&a) {
+                bail!("cannot add audio input");
+            }
+            writer.addInput(&a);
+            Ok(a)
+        };
+        // Track order (documented in README): mix, system, mic.
+        let both = system_audio && mic;
+        let want_mix = both && layout != AudioLayout::Stems;
+        let want_stems = !both || layout != AudioLayout::Mix;
+        let mix_input = if want_mix { Some(mk_audio(2, 256_000)?) } else { None };
+        let sys = if system_audio && want_stems { Some(mk_audio(2, 256_000)?) } else { None };
+        let mic = if mic && want_stems { Some(mk_audio(1, 128_000)?) } else { None };
+        if let (Some(mixi), true) = (&mix_input, want_stems) {
+            // One alternate group, mix as default: QuickTime/AVPlayer play
+            // only the mix; editors still see every track.
+            let mut members: Vec<&AVAssetWriterInput> = vec![mixi];
+            members.extend(sys.as_deref());
+            members.extend(mic.as_deref());
+            let arr = objc2_foundation::NSArray::from_slice(&members);
+            let group =
+                AVAssetWriterInputGroup::initWithInputs_defaultInput(AVAssetWriterInputGroup::alloc(), &arr, Some(mixi));
+            if writer.canAddInputGroup(&group) {
+                writer.addInputGroup(&group);
+            } else {
+                bail!("cannot add audio track group");
+            }
+        }
+        if !writer.startWriting() {
+            bail!("startWriting failed: {}", err_text(&writer));
+        }
+        Ok(Out { writer, video, adaptor, sys, mic, mix_input })
     }
 }
 

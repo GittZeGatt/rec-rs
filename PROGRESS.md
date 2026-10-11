@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Status (2026-10-11 ~00:10 EDT): working end to end, nothing to approve
+## Status (2026-10-11 ~00:10 EDT): CLI recorder working end to end; GUI milestone in progress
 
 `rec` records a 1080p60 or 4K60 screen, system audio, mic and webcam overlay into one `.mov`.
 AVFoundation (QuickTime's engine) reports every file playable and decodes every frame and audio
@@ -16,6 +16,22 @@ open -a "QuickTime Player" ~/Movies/rec-*.mov
 
 A 10-second reference clip is at `analysis/raw/sample-4k60.mov`. It contains 4K60 HEVC, the
 webcam overlay, a mix track, and system and mic stems.
+
+## Goal milestones: plain status
+
+**Caveat:** the original task message arrived truncated. It began mid-sentence at "...est once,
+write clearly in PROGRESS.md what to approve...", so I never saw the numbered milestone list.
+Milestones 1–5 below are inferred from the stated "done" condition, not copied from your list.
+Milestone 6 is as you described it on 2026-10-11.
+
+| # | Milestone | Status |
+|---|---|---|
+| 1 (inferred) | Permissions requested once and documented, with a stable signed identity | **Done** |
+| 2 (inferred) | Screen capture at 1080p60 and 4K60, hardware H.264/HEVC, constant 60 fps | **Done**, verified |
+| 3 (inferred) | System audio and mic, mix track plus stems, in sync | **Done**, verified by tooling; no human clap test yet |
+| 4 (inferred) | Webcam overlay | **Done**, verified |
+| 5 (inferred) | Plays in QuickTime and imports into an editor; README with OBS table and gaps | **Partly done**. AVFoundation and ffmpeg verified. Not yet opened in QuickTime's window or imported into Resolve by a person. |
+| 6 | GUI with preview, menu bar icon, Cmd+Shift+R hotkey | **Not done** as of the first report. In progress now, see below. |
 
 ## Permissions: all granted
 
