@@ -20,6 +20,19 @@ pub fn disclaim_and_reexec() {
     if std::env::var_os(DISCLAIM_ENV).is_some() || std::env::var_os("REC_NO_DISCLAIM").is_some() {
         return;
     }
+    // Already responsible for ourselves (launched via `open Rec.app`, Login
+    // Items, Finder): nothing to do, and LaunchServices expects this process
+    // to be the app. Checking the actual responsible pid (not ppid == 1)
+    // keeps backgrounded/orphaned CLI launches correct.
+    type GetResponsible = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
+    let get = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"responsibility_get_pid_responsible_for_pid".as_ptr()) };
+    if !get.is_null() {
+        let get: GetResponsible = unsafe { std::mem::transmute::<*mut c_void, GetResponsible>(get) };
+        let me = unsafe { libc::getpid() };
+        if unsafe { get(me) } == me {
+            return;
+        }
+    }
     type SetDisclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, c_int) -> c_int;
     let sym = unsafe {
         libc::dlsym(
