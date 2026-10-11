@@ -52,6 +52,57 @@ if scripts/synccheck.py "$OUT/pause.mov" --max-ms 1 >"$OUT/pause.check" 2>&1 \
 else
   echo "FAIL  pause-resume  (see $OUT/pause.check)"; fail=$((fail+1))
 fi
+# Replay buffer: no file recorded, `rec-rs save-replay` mid-run writes the
+# last seconds to an MP4 that is in sync.
+mkdir -p "$OUT/replay"
+"$REC" record -q --test-pattern --no-mic --no-record --replay 15 -t 9 -o "$OUT/replay/none.mov" >/dev/null 2>"$OUT/replay.log" &
+sleep 7; "$REC" save-replay >/dev/null 2>&1 || true; wait || true
+sleep 1
+r=$(ls "$OUT"/replay/replay-*.mp4 2>/dev/null | head -1 || true)
+if [ -n "$r" ] && "$REC" probe "$r" >"$OUT/replay.probe" 2>&1 \
+   && scripts/synccheck.py "$r" --max-ms 1 >"$OUT/replay.check" 2>&1 \
+   && [ ! -e "$OUT/replay/none.mov" ]; then
+  echo "PASS  replay  (saved without stopping, $(grep -m1 'audio 0' "$OUT/replay.check" | sed 's/.*offset //'))"; pass=$((pass+1))
+else
+  echo "FAIL  replay  (see $OUT/replay.log / .check)"; fail=$((fail+1))
+fi
+# Streaming: RTMP and WHIP from one encode to a private MediaMTX (spare
+# ports), checked through the server's own recordings.
+if command -v mediamtx >/dev/null; then
+  M="$OUT/mediamtx"; mkdir -p "$M"
+  cat >"$M/mediamtx.yml" <<YML
+logLevel: warn
+rtsp: false
+hls: false
+srt: false
+moq: false
+rtmpAddress: :19350
+webrtcAddress: :18889
+webrtcLocalUDPAddress: :18189
+pathDefaults:
+  record: yes
+  recordPath: $M/rec/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+paths:
+  all_others:
+YML
+  (cd "$M" && exec mediamtx mediamtx.yml >"$M/server.log" 2>&1) &
+  mpid=$!; sleep 2
+  REC_STREAM_KEY=selftest "$REC" record -q --test-pattern --no-mic --no-record -t 10 -o "$M/none.mov" \
+    --stream rtmp://127.0.0.1:19350/live --stream http://127.0.0.1:18889/whiptest/whip >/dev/null 2>"$OUT/stream.log" || true
+  sleep 2; kill "$mpid" 2>/dev/null || true; wait "$mpid" 2>/dev/null || true
+  for kind in rtmp:live/selftest:1 whip:whiptest:20; do
+    name=${kind%%:*}; rest=${kind#*:}; path=${rest%:*}; max=${rest##*:}
+    f=$(ls "$M/rec/$path"/*.mp4 2>/dev/null | head -1 || true)
+    if [ -n "$f" ] && scripts/synccheck.py "$f" --max-ms "$max" >"$OUT/stream-$name.check" 2>&1; then
+      echo "PASS  stream-$name  ($(grep -m1 'audio 0' "$OUT/stream-$name.check" | sed 's/.*offset //'))"; pass=$((pass+1))
+    else
+      echo "FAIL  stream-$name  (see $OUT/stream.log, $OUT/stream-$name.check)"; fail=$((fail+1))
+    fi
+  done
+else
+  echo "SKIP  stream-rtmp, stream-whip  (install mediamtx: brew install mediamtx)"; skip=$((skip+1))
+fi
 # Quit like the Dock does (-[NSApp terminate:]) mid-recording: the app must
 # finalize the file first. Screen only, no mic or camera.
 if [ "${1:-}" != "--no-screen" ] && has "screen recording"; then
@@ -98,6 +149,22 @@ PY
     echo "PASS  gui-app  (preview, record, pause, saved and probed, pause cut from file, settings window, live overlay change)"; pass=$((pass+1))
   else
     echo "FAIL  gui-app  (see $OUT/gui.log)"; fail=$((fail+1))
+  fi
+fi
+# App: replay buffer kept across window close and a recording, saved with
+# the hotkey's command (no stream: that is covered above).
+if [ "${1:-}" != "--no-screen" ] && has "screen recording"; then
+  mkdir -p "$OUT/guilive"
+  echo '{"scene": "screen", "mic_enabled": false, "replay_enabled": true, "replay_secs": 15}' >"$OUT/guilive/settings.json"
+  if REC_GUI_SELFTEST=live REC_GUI_BACKGROUND=1 REC_OUTPUT_DIR="$OUT/guilive" REC_SETTINGS="$OUT/guilive/settings.json" \
+       "$REC" gui >"$OUT/guilive.log" 2>&1 \
+     && grep -q 'window hidden, live session=true' "$OUT/guilive.log" \
+     && grep -q 'after recording live session=true' "$OUT/guilive.log" \
+     && f=$(sed -n 's/.*replay saved=Some("\(.*\)") held.*/\1/p' "$OUT/guilive.log") && [ -n "$f" ] \
+     && "$REC" probe "$f" >"$OUT/guilive.probe" 2>&1; then
+    echo "PASS  gui-replay  (kept across window close and a recording, saved with the hotkey's command)"; pass=$((pass+1))
+  else
+    echo "FAIL  gui-replay  (see $OUT/guilive.log)"; fail=$((fail+1))
   fi
 fi
 echo "$pass passed, $fail failed, $skip skipped"
