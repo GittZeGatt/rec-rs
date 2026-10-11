@@ -134,7 +134,16 @@ struct Encoders {
     silence_t: Option<f64>,
     /// A video encoder is being created in the background.
     creating: bool,
+    /// Last frame encoded and its time, repeated over short gaps (a
+    /// capture session being swapped) so streams see no hole.
+    last_frame: Option<(f64, crate::util::SendBox<objc2_core_foundation::CFRetained<CVPixelBuffer>>)>,
+    /// End time of the audio encoded so far; short gaps get silence.
+    audio_end: Option<f64>,
 }
+
+/// Gaps up to this long are filled (repeated frame, silence); longer ones
+/// restart the timeline.
+const MAX_FILL: f64 = 3.0;
 
 type Made = Arc<Mutex<Option<Result<VideoEncoder>>>>;
 
@@ -152,7 +161,17 @@ impl Default for Live {
     fn default() -> Self {
         Live {
             hub: Arc::default(),
-            enc: Mutex::new(Encoders { video: None, aac: None, opus: None, mixer: None, sources: [false; 2], silence_t: None, creating: false }),
+            enc: Mutex::new(Encoders {
+                video: None,
+                aac: None,
+                opus: None,
+                mixer: None,
+                sources: [false; 2],
+                silence_t: None,
+                creating: false,
+                last_frame: None,
+                audio_end: None,
+            }),
             made: Arc::default(),
             cfg: Mutex::new(LiveConfig::default()),
             active: AtomicBool::new(false),
@@ -185,6 +204,8 @@ impl Live {
             e.aac = None;
             e.opus = None;
             e.mixer = None;
+            e.last_frame = None;
+            e.audio_end = None;
         }
     }
 
@@ -192,7 +213,8 @@ impl Live {
         self.cfg.lock().unwrap().clone()
     }
 
-    /// Change the encode; the encoder restarts with a keyframe.
+    /// Change the encode; the encoder restarts with a keyframe. The replay
+    /// buffer starts over (a clip holds one set of parameter sets).
     pub fn set_config(&self, c: LiveConfig) {
         let mut cfg = self.cfg.lock().unwrap();
         if *cfg != c {
@@ -201,6 +223,14 @@ impl Live {
             e.video = None;
             e.aac = None;
             e.opus = None;
+            e.last_frame = None;
+            e.audio_end = None;
+            // Lock order: encoders, then hub.
+            let mut hub = self.hub.lock().unwrap();
+            hub.formats = Formats::default();
+            if let Some(r) = &mut hub.replay {
+                r.clear();
+            }
         }
     }
 
@@ -255,11 +285,26 @@ impl Live {
                 None => return,
             }
         }
+        let last = e.last_frame.take();
         if let Some(v) = e.video.as_mut() {
             if want_key {
                 v.force_keyframe();
             }
+            // A short hole (sessions swapped): repeat the last frame on the
+            // frame grid up to this one.
+            let step = 1.0 / fps.max(1) as f64;
+            if let Some((lt, lf)) = &last
+                && t - lt > 1.5 * step
+                && t - lt < MAX_FILL
+            {
+                let mut ft = lt + step;
+                while ft < t - 0.5 * step {
+                    v.encode(&lf.0, ft);
+                    ft += step;
+                }
+            }
             v.encode(frame, t);
+            e.last_frame = Some((t, crate::util::SendBox(objc2_core_foundation::Type::retain(frame))));
         }
         // No audio source: keep a silent track so players and services
         // that require audio accept the stream.
@@ -303,6 +348,22 @@ impl Live {
         let mut packets = vec![];
         {
             let mut e = self.enc.lock().unwrap();
+            // A short hole (sessions swapped): fill it with silence so the
+            // audio timeline stays continuous.
+            let mut t = t;
+            let mut filled;
+            let mut frames = frames;
+            if let Some(end) = e.audio_end
+                && t - end > 0.005
+                && t - end < MAX_FILL
+            {
+                let n = ((t - end) * audio::RATE).round() as usize;
+                filled = vec![[0.0f32; 2]; n];
+                filled.extend_from_slice(frames);
+                frames = &filled;
+                t = end;
+            }
+            e.audio_end = Some(t + frames.len() as f64 / audio::RATE);
             if e.aac.is_none() {
                 match AudioEncoder::new(AudioCodec::Aac, cfg.audio_bitrate) {
                     Ok(a) => e.aac = Some(a),
@@ -474,7 +535,7 @@ mod tests {
         let mut audio_done = 0usize;
         // The encoder starts in the background: let it come up first, as it
         // does while a real capture warms up.
-        {
+        if live.enc.lock().unwrap().video.is_none() {
             let mut buf = std::ptr::null_mut();
             unsafe { CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf)) };
             let pb: objc2_core_foundation::CFRetained<CVPixelBuffer> =
@@ -514,6 +575,49 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
+    }
+
+    /// Records every packet's (is video, pts).
+    struct Collect(Arc<Mutex<Vec<(bool, f64)>>>);
+
+    impl Output for Collect {
+        fn packet(&mut self, p: &Packet, _f: &Formats) {
+            let item = match p {
+                Packet::Video(v) => (true, v.pts),
+                Packet::Audio(a) => (false, a.pts),
+            };
+            self.0.lock().unwrap().push(item);
+        }
+        fn status(&self) -> OutputStatus {
+            OutputStatus::default()
+        }
+        fn stop(&mut self) {}
+    }
+
+    /// Swapping capture sessions leaves a hole of a few hundred ms; the
+    /// stream must stay continuous (repeated frame, silence).
+    #[test]
+    fn short_gaps_are_filled() {
+        let live = Live::new();
+        live.set_config(LiveConfig { width: 640, height: 360, bitrate: 1_000_000, keyframe_secs: 1.0, ..Default::default() });
+        let got = Arc::new(Mutex::new(vec![]));
+        live.add_output(Box::new(Collect(got.clone())));
+        live.begin_session(true, false);
+        feed(&live, 2.0, 7000.0);
+        live.begin_session(true, false);
+        feed(&live, 2.0, 7002.25);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let got = got.lock().unwrap();
+        let mut video: Vec<f64> = got.iter().filter(|p| p.0).map(|p| p.1).collect();
+        video.sort_by(f64::total_cmp);
+        let worst = video.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
+        assert!(video.len() > 110, "{} frames", video.len());
+        // The new session's frames are on another phase of the frame grid:
+        // at most one and a half frame intervals apart.
+        assert!(worst <= 1.5 / 30.0 + 1e-6, "video gap {worst}");
+        let audio: Vec<f64> = got.iter().filter(|p| !p.0).map(|p| p.1).collect();
+        let worst = audio.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
+        assert!(worst < 1024.0 / 48000.0 + 0.001, "audio gap {worst}");
     }
 
     #[test]

@@ -517,7 +517,6 @@ fn status_text(v: &[Amf]) -> String {
 struct Tag {
     typ: u8, // 8 audio, 9 video, 18 data
     ts: u32,
-    key: bool,
     body: Arc<Vec<u8>>,
 }
 
@@ -704,7 +703,7 @@ impl Output for RtmpOutput {
                     s.dropped += 1;
                     return;
                 }
-                s.queue.push_back(Tag { typ: 9, ts, key: v.key, body: Arc::new(flv_video(v.key, &v.data)) });
+                s.queue.push_back(Tag { typ: 9, ts, body: Arc::new(flv_video(v.key, &v.data)) });
             }
             Packet::Audio(a) => {
                 let Some(t0) = self.t0 else { return };
@@ -715,7 +714,7 @@ impl Output for RtmpOutput {
                 if s.queue.len() > 2000 {
                     return;
                 }
-                s.queue.push_back(Tag { typ: 8, ts, key: false, body: Arc::new(flv_audio(&a.data)) });
+                s.queue.push_back(Tag { typ: 8, ts, body: Arc::new(flv_audio(&a.data)) });
             }
         }
         cv.notify_one();

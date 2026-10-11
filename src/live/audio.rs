@@ -203,6 +203,7 @@ impl AudioEncoder {
     }
 
     /// Encoder delay in frames (AAC priming).
+    #[cfg(test)]
     pub fn priming(&self) -> u32 {
         self.leading
     }
