@@ -1,19 +1,28 @@
-# rec
+# rec-rs
 
-A native macOS screen recorder written in Rust. It records the screen, system audio, microphone
-and webcam into a single `.mov` that plays in QuickTime and imports cleanly into editors.
+A simple, fast, reliable screen and camera recorder for macOS, written in Rust, as an alternative
+to OBS for recording YouTube videos. It records the screen, system audio, microphone and webcam
+into one `.mov` or `.mp4` that plays in QuickTime and imports into Final Cut, Premiere and
+DaVinci Resolve.
 
-Under the hood it uses only Apple frameworks:
+It uses only Apple frameworks:
 
-- **ScreenCaptureKit** for display, window and region capture, system audio and microphone.
+- **ScreenCaptureKit** for display and window capture, system audio and the microphone. Frames
+  are IOSurface-backed `CVPixelBuffer`s that are never copied.
 - **AVCaptureSession** for the webcam, and optionally the microphone.
-- **CoreImage on Metal** for the webcam picture-in-picture overlay.
-- **VideoToolbox via AVAssetWriter** for hardware H.264, HEVC or ProRes encoding into
-  QuickTime/MP4.
+- **CoreImage on Metal** for compositing: webcam picture-in-picture and scenes.
+- **VideoToolbox through AVAssetWriter** for hardware H.264, HEVC or ProRes 422, plus AAC
+  audio.
 
-There is no FFmpeg, no OBS and no Electron, and the binary is a few MB.
+There is no FFmpeg, OBS or Electron at runtime. The UI is egui on wgpu in the paper-rs style:
+transparent titlebar and the Inter font.
 
-Requires macOS 15 or later on Apple Silicon. It was developed on macOS 27 with an M4 Pro.
+It needs macOS 15 or later on Apple Silicon. It was developed and tested on macOS 27 on an M4
+Pro MacBook Pro.
+
+The code is a clean-room implementation, licensed MIT OR Apache-2.0. OBS (GPL-2.0) was studied
+for its architecture only and no OBS code was copied. See
+[analysis/OBS_ARCHITECTURE.md](analysis/OBS_ARCHITECTURE.md).
 
 ## Reverse-engineered origin
 
@@ -25,196 +34,237 @@ the OBS Project. No original OBS code or assets are included in this repository.
 ## Build
 
 ```sh
-./scripts/build.sh          # cargo build --release, assemble + sign dist/Rec.app
-dist/rec --help
+./scripts/build.sh          # cargo build --release, then assemble and sign dist/Rec.app
+dist/rec-rs --help          # dist/rec is a short alias
 ```
 
-The script signs `dist/Rec.app` with your Apple Development identity, falling back to ad-hoc
-signing. A stable signature keeps the macOS privacy grants in place across rebuilds. You can
-override the identity with `REC_SIGN_IDENTITY="..."`. Put `dist/` on your `PATH` or symlink
-`dist/rec` anywhere.
+Build output goes to `~/.cache/rec-rs-target` (`CARGO_TARGET_DIR`), never into the repo,
+because the repo is synced between machines. The script signs `dist/Rec.app` with your Apple
+Development identity, so the macOS privacy grants survive rebuilds. Override it with
+`REC_SIGN_IDENTITY`.
 
-## Permissions (one-time)
+Tests:
 
 ```sh
-dist/rec permissions --request
+cargo test                       # unit tests: pause timeline, mixer, CLI, settings, scenes
+scripts/selftest.sh              # records through every pipeline and verifies each file
+scripts/selftest.sh --no-screen  # skip the cases that need Screen Recording
+scripts/soak.sh 1800             # 30-minute 4K60 soak with CPU/memory sampling and ffprobe checks
+scripts/synccheck.py FILE        # A/V offset of a flash + beep recording
+```
+
+Test recordings go to `~/Movies/rec-rs-tests/`.
+
+## Permissions (one time)
+
+```sh
+dist/rec-rs permissions --request
 ```
 
 Then enable **Rec** under **System Settings → Privacy & Security → Screen & System Audio
 Recording**. Microphone and camera are approved from the system prompts.
 
-`rec` re-launches itself with "responsibility disclaimed". macOS therefore attributes the
-permissions to the signed **Rec** app rather than to whatever terminal, tmux or IDE started it.
-macOS may also ask you to confirm that Rec can "bypass the system private window picker". Click
-**Allow**. The OS repeats this check periodically for every recorder, OBS included.
+- `rec-rs` re-launches itself with responsibility disclaimed. macOS therefore asks about and
+  remembers the signed **Rec** app rather than your terminal.
+- If macOS asks whether Rec may "bypass the system private window picker", click **Allow**.
+- `dist/rec-rs permissions` shows the current status.
 
-`dist/rec permissions` shows the current status.
-
-## Menu bar app
+## The app
 
 ```sh
-open dist/Rec.app          # or: dist/rec gui   (or just: dist/rec)
+open dist/Rec.app          # or: dist/rec-rs   (or: dist/rec-rs gui [--settings] [--start-recording])
 ```
 
-A record icon appears in the menu bar. Press **⇧⌘R** anywhere to start or stop recording; the
-icon turns red and shows the elapsed time. The menu has:
+The **main window** contains:
 
-- **Start/Stop Recording** (⇧⌘R).
-- **Show Preview**: a floating 16:9 window with the live output, including the webcam overlay.
-  It works before recording, so you can frame the shot. Rec's own windows are excluded from the
-  capture, so the preview never records itself.
-- **Resolution** (1080p, 1440p, 4K, Native), **Webcam Overlay**, **Microphone** and **System
-  Audio** toggles. Settings persist between launches.
-- **Reveal Last Recording** and **Open Recordings Folder** (`~/Movies`).
+- **Live preview** of exactly what will be recorded, including the webcam overlay. Rec's own
+  windows are excluded from capture.
+- **Scene**:
+  - Screen.
+  - Screen + Cam: the webcam in a corner, rounded, circle or rectangle.
+  - Camera: the webcam full frame.
 
-Recordings use the same pipeline and output format as the CLI. `rec stop` also stops a
-recording started from the menu bar, and the app finalizes the file if it is quit or sent
-SIGTERM mid-recording. `rec gui --start-recording` starts recording at launch, which suits a
-Login Item.
+  While recording you can switch scenes live, provided the recording started with a camera
+  scene.
+- **Sources**:
+  - Display.
+  - Entire display, or a single window.
+  - Camera.
+  - Microphone.
+  - System audio.
+- **Record / Stop** (⇧⌘R from anywhere), **Pause / Resume**, the recording timer, and **level
+  meters** for system audio and mic with peak hold.
+- **Reveal Last** and **Open Folder**.
 
-⇧⌘R is registered system-wide while Rec runs. Other apps that use ⇧⌘R, such as a browser's
-hard reload, won't see it until Rec quits. If another app already owns the combo, the menu says
-the hotkey is unavailable.
+The **settings window** (⌘, or the Settings… button) covers:
 
-## Record from the command line
+- Output folder and container (`.mov` or `.mp4`).
+- Resolution: 720p, 1080p, 1440p, 4K or native.
+- Frame rate, codec (auto, H.264, HEVC, ProRes) and bitrate.
+- Cursor and click highlighting.
+- Audio devices, track layout and gains.
+- Camera device, plus overlay corner, shape, size and mirroring.
+
+Settings persist in `~/Library/Application Support/rec-rs/settings.json`.
+
+Rec is a regular app with a Dock icon and an app menu (Settings… ⌘,, Hide ⌘H, Quit ⌘Q, Window ▸
+Minimize, Close, Show Rec Window). Closing the main window keeps Rec running, in the Dock and the
+menu bar, and stops the preview. Clicking the Dock icon brings the window back. Quitting from
+the Dock, the menu or a logout finalizes a running recording first.
+
+The **menu bar item** shows a red dot and the elapsed time while recording. Its menu has
+Start/Stop, Pause/Resume, Show Window, Settings, Reveal Last, Open Folder and Quit.
+
+You can also control a running recording, from the app or the CLI, from any shell:
 
 ```sh
-# 1080p60 screen + system audio + default mic (Ctrl-C to stop)
-dist/rec record
-
-# 4K60 HEVC with the webcam in the corner, saved to a given file
-dist/rec record -r 4k --webcam -o ~/Movies/demo.mov
-
-# a specific window, at native resolution, for 30 seconds
-dist/rec record --window "Safari" -r native -t 30
-
-# stop a recording from another shell / hotkey (prints the file path)
-dist/rec stop
+rec-rs pause      # SIGUSR1
+rec-rs resume     # SIGUSR2
+rec-rs stop       # finalizes, prints the file
 ```
 
-The default output is `~/Movies/rec-YYYY-MM-DD-HHMMSS.mov`. A live status line shows frame
-counts and peak levels for system audio and mic.
+Quitting the app or sending it SIGTERM mid-recording finalizes the file first.
+
+⇧⌘R is registered system-wide while Rec runs. A browser's hard reload therefore won't see it
+until Rec quits. If another app already owns the shortcut, the UI says so.
+
+## Command line
+
+```sh
+# the canonical example
+rec-rs record --display 1 --mic default --system-audio --cam --out file.mp4 --duration 10
+
+# 4K60 HEVC, screen + webcam, Ctrl-C (or `rec-rs stop`) to finish
+rec-rs record -r 4k --cam
+
+# one window at native resolution, camera-only scene, ProRes
+rec-rs record --window "Safari" -r native --codec prores
+rec-rs record --scene cam -o talking-head.mov
+```
+
+The default output is `~/Movies/rec-YYYY-MM-DD-HHMMSS.mov`. A live status line shows the
+recorded time, frame counts and peak levels. `--duration` is exact: it is counted in output
+frames, and pauses don't count.
 
 | Option | Default | Notes |
 |---|---|---|
-| `-r, --resolution` | `1080p` | `720p`, `1080p`, `1440p`, `4k`, `native`, or `WxH`. Presets produce exact 16:9 frames, pillar-boxed if the display is not 16:9. |
-| `--keep-aspect` | off | Shrink the frame to the display's aspect ratio instead of pillar-boxing. |
-| `-f, --fps` | `60` | Any divisor of 60000 (24, 25, 30, 50, 60, 120). |
-| `--codec` | auto | `h264` up to 1080p, `hevc` above. `prores` gives ProRes 422 in `.mov`. |
-| `--bitrate` | auto | Mb/s. Defaults to about 20 Mb/s for 1080p60 H.264 and about 50 Mb/s for 4K60 HEVC. |
-| `-d, --display` | `0` | Display index from `rec devices`. |
-| `--window` | | Window ID or app/title substring from `rec devices`. |
-| `--region X,Y,W,H` | | Crop to a display region, in points from the top-left. |
-| `--mic DEVICE` / `--no-mic` | default mic | Unique ID or name substring. |
-| `--no-system-audio` | | |
-| `--audio-tracks` | `both` | `both` writes the mix plus system and mic stems. `mix` writes the mix only. `stems` writes system and mic only. |
-| `--system-gain`, `--mic-gain` | `0` | dB, applied to the mix track. |
-| `-w, --webcam [DEVICE]` | off | Picture-in-picture overlay. Defaults to the system-preferred camera. |
-| `--pip-size`, `--pip-corner`, `--pip-shape`, `--no-mirror` | `0.22`, bottom-right, rounded | The shape can be `rounded`, `circle` or `rect`. |
-| `--no-cursor`, `--clicks` | cursor shown | `--clicks` highlights mouse clicks. |
-| `-t, --duration` | | Stop after N seconds. |
-| `--mic-backend` | `sck` | `sck` uses ScreenCaptureKit. `avcapture` uses AVCaptureSession. |
-| `--test-pattern [--noise]` | | Synthetic source for self-tests. Needs no screen permission. |
-
-Run `scripts/selftest.sh` to record and verify a clip through every pipeline. Add
-`--no-screen` to skip the cases that need screen access.
+| `-o, --out, --output` | `~/Movies/rec-….mov` | `.mov` or `.mp4`. |
+| `-d, --display N` | `1` | Display number from `rec-rs devices` (1 = main). |
+| `--window W` | | Window ID or app/title substring. |
+| `--region X,Y,W,H` | | Crop a display region (points from top-left). |
+| `-r, --resolution` | `1080p` | `720p`, `1080p`, `1440p`, `4k`, `native`, `WxH`. Exact 16:9 frames, pillar-boxed when the display isn't 16:9 (or `--keep-aspect`). |
+| `-f, --fps` | `60` | 24, 25, 30, 50, 60, 120. |
+| `--codec` | auto | `h264` up to 1080p, `hevc` above, `prores` (422, `.mov`). |
+| `--bitrate` | auto | Mb/s. About 20 for 1080p60 H.264, about 50 for 4K60 HEVC. |
+| `--system-audio` / `--no-system-audio` | on | |
+| `--mic DEVICE` / `--no-mic` | `default` | Unique ID or name substring. |
+| `-w, --cam, --webcam [DEVICE]` | off | `default` or ID or name. Turns on the Screen + Cam scene. |
+| `--scene` | `screen-cam` with a camera, else `screen` | `screen`, `screen-cam`, `cam`. |
+| `--pip-size`, `--pip-corner`, `--pip-shape`, `--no-mirror` | `0.22`, bottom-right, rounded | Shape: `rounded`, `circle`, `rect`. |
+| `--audio-tracks` | `both` | `both` = mix plus system and mic stems; `mix`; `stems`. |
+| `--system-gain`, `--mic-gain` | `0` | dB, in the mix track. |
+| `--no-cursor`, `--clicks` | cursor shown | |
+| `-t, --duration` | | Seconds of output. |
+| `--mic-backend` | `sck` | `sck` (ScreenCaptureKit) or `avcapture`. |
+| `--test-pattern [--noise]` | | Synthetic source: the frame flashes white and the "system audio" beeps once a second, for self-tests and sync checks. |
 
 Other commands:
 
-- `rec gui` (or `rec` with no arguments) starts the menu bar app.
-
-- `rec devices` lists displays, windows, cameras and microphones.
-- `rec probe FILE` checks a recording with AVFoundation, QuickTime's own engine. It reports
-  playability and track layout, and decodes every video frame and audio sample.
+- `rec-rs devices` lists displays, windows, cameras and mics.
+- `rec-rs probe FILE` checks a file with AVFoundation, QuickTime's engine, and decodes every
+  sample.
+- `rec-rs permissions [--request]` shows or requests the privacy grants.
+- `rec-rs stop`, `rec-rs pause` and `rec-rs resume` control a running recording.
 
 ## Output format
 
 | Track | Contents |
 |---|---|
-| 1 video | H.264 High, HEVC Main (`hvc1`) or ProRes 422. Constant 60 fps, BT.709 tagged. |
-| 2 audio | **Mix** of system and mic. AAC-LC 48 kHz stereo at 256 kb/s. Enabled by default, so players and uploaders use it. |
-| 3 audio | System audio stem. AAC 48 kHz stereo. |
-| 4 audio | Mic stem. AAC 48 kHz mono. |
+| 1 video | H.264 High, HEVC Main (`hvc1`) or ProRes 422. Constant frame rate, BT.709 tagged, keyframe every 2 s. |
+| 2 audio | **Mix** of system and mic: AAC-LC 48 kHz stereo, 256 kb/s. The default track, so players and uploaders use it. |
+| 3 audio | System audio stem: AAC 48 kHz stereo. |
+| 4 audio | Mic stem: AAC 48 kHz mono. |
 
-With only one audio source enabled, the file has a single audio track. The three audio tracks
-share one alternate group with the mix as default. QuickTime therefore plays only the mix, while
-editors still see every track.
-
-- **Constant frame rate.** ScreenCaptureKit only sends frames when pixels change. `rec` emits on
-  an exact 1/fps grid and repeats the newest frame when needed, as OBS does. This keeps editors
-  such as Premiere, Resolve and Final Cut in sync over long recordings.
-- **Shared clock.** Screen, system audio, mic and webcam are all stamped on the host clock.
-  Audio is never resampled in time, so it cannot drift from video.
-- **Webcam sync.** Video emission runs slightly behind real time so the webcam frame captured at
-  each instant is used. Webcams deliver frames about 70–90 ms late, and the lag adapts to the
-  slowest source seen. Set `REC_DEBUG=1` to print measured latencies.
-- **Crash-safe.** Movie fragments are written every 5 s, so a crash or power loss leaves a
-  playable file up to the last fragment. A normal stop rewrites the file as a regular movie,
-  laid out as `ftyp wide mdat moov`.
+- **Track grouping.** With one audio source there is a single audio track. The audio tracks
+  share an alternate group with the mix as default, so QuickTime plays the mix and editors see
+  every track.
+- **Constant frame rate.** ScreenCaptureKit only sends a frame when pixels change. rec-rs
+  writes on an exact 1/fps grid and repeats the newest frame when needed. Measured frame spacing
+  is exactly 16.667 ms.
+- **Single clock.** Screen, system audio, mic and webcam are all stamped on the host clock, and
+  audio is never stretched. The flash/beep sync test measures 0.0 ms between video and audio in
+  the file, including across pauses.
+- **Webcam sync.** Emission runs a little behind real time, so the webcam frame captured at each
+  instant is the one used. Webcams deliver frames 70–120 ms late, and the lag adapts to the
+  slowest source.
+- **Crash-safe.** Movie fragments are written every 2 s, so a crash or power loss leaves a
+  playable file up to the last fragment. A normal stop finalizes a regular movie
+  (`ftyp wide mdat moov`).
+- **Pause.** Pauses cut whole frame slots out of the timeline. Audio is cut at the exact sample
+  and shifted with the video, so there is no gap and no drift.
 
 ## Feature comparison with OBS (macOS)
 
-| Feature | OBS 31 | rec |
+| Feature | OBS 32 | rec-rs |
 |---|---|---|
-| Full-display capture | ✅ | ✅ ScreenCaptureKit |
-| Window capture | ✅ | ✅ `--window` |
-| Region / crop | ✅ crop filter | ✅ `--region` |
+| Display capture | ✅ | ✅ ScreenCaptureKit, zero-copy |
+| Window capture | ✅ | ✅ |
+| Region / crop | ✅ crop filter | ✅ `--region` (CLI) |
 | Application capture (all windows of an app) | ✅ | ❌ |
-| Several displays or sources at once, scenes, transitions | ✅ | ❌ one source plus webcam |
+| Scenes | ✅ unlimited, free layout, transitions | ✅ three fixed scenes (screen, screen + cam, cam), switchable live, cut only |
+| Multiple displays/sources at once | ✅ | ❌ one screen source plus the webcam |
 | System audio | ✅ | ✅ |
-| Microphone | ✅ | ✅ through ScreenCaptureKit or AVCapture |
-| Webcam overlay | ✅ free layout | ✅ corner picture-in-picture: rounded, circle or rect, mirrored |
+| Microphone | ✅ | ✅ |
+| Webcam overlay | ✅ any layout | ✅ corner PiP: rounded, circle or rect, mirrored |
 | Separate audio tracks | ✅ up to 6 | ✅ mix plus system and mic stems |
-| Mixer gain | ✅ | ✅ dB per source |
+| Per-source gain | ✅ | ✅ |
 | Audio filters (noise suppression, compressor) | ✅ | ❌ |
 | Hardware H.264 / HEVC | ✅ | ✅ |
 | ProRes | ✅ | ✅ 422 |
-| 10-bit / HDR capture | ✅ | ❌ 8-bit SDR, BT.709 |
-| Constant frame rate output | ✅ | ✅ |
-| Crash-safe recording | ✅ with fragmented MP4/MOV | ✅ fragments every 5 s, then finalized |
-| Cursor hide, click highlight | partial | ✅ both |
-| Pause / resume | ✅ | ❌ |
-| Replay buffer | ✅ | ❌ |
-| Streaming (RTMP, WHIP) | ✅ | ❌ |
-| GUI | ✅ full window | ✅ menu bar app (settings menu); no scene editor |
-| Live preview | ✅ | ✅ floating preview window |
-| Global start/stop hotkey | ✅ configurable | ✅ ⇧⌘R (fixed) |
-| Live audio meters | ✅ | ✅ peak dBFS in the status line |
-| Footprint | about 300 MB app | a few MB binary, about 30% of one core at 4K60 with webcam |
-| Permissions attributed to the recorder itself | ✅ app bundle | ✅ disclaimed re-launch of signed `Rec.app` |
+| 10-bit / HDR | ✅ | ❌ 8-bit SDR, BT.709 |
+| Constant frame rate | ✅ | ✅ exact grid |
+| Crash-safe files | ✅ hybrid/fragmented MP4 | ✅ fragments every 2 s |
+| Pause / resume | ✅ | ✅ sample-accurate |
+| Live preview | ✅ | ✅ |
+| Level meters | ✅ | ✅ peak with hold |
+| Global hotkey | ✅ configurable | ✅ ⇧⌘R (fixed) |
+| Menu bar control | ❌ | ✅ menu bar item plus Dock app |
+| Headless CLI | ❌ (obs-cli via websocket) | ✅ `rec-rs record …`, `stop`, `pause`, `resume` |
+| Replay buffer, streaming | ✅ | ❌ |
+| Footprint | about 300 MB app | about 16 MB app; about 6% of one core at 4K60 screen-only, about 34% with the webcam overlay (see [PERFORMANCE.md](PERFORMANCE.md)) |
+| Encoder input | frames copied back to the CPU for encoding | IOSurface passed straight to VideoToolbox |
 
 ## Known gaps
 
-- The GUI is a menu bar app, not a full window. Window and region capture, codec, bitrate and
-  pip layout are CLI-only. The hotkey is fixed to ⇧⌘R.
-- There are no scenes, no multi-display capture and no capture of every window of an app.
-- There is no pause/resume, replay buffer or streaming.
-- There are no audio filters. The mic is recorded as the device delivers it.
-- Capture is 8-bit SDR only. HDR displays are tone-mapped by ScreenCaptureKit.
-- The webcam is a fixed-corner overlay, and it is burned into the video track. There is no
-  separate webcam track or file.
-- A webcam overlay switches the pipeline from 4:2:0 to BGRA plus CoreImage compositing. This
-  costs more memory bandwidth but held up at 4K60 in testing.
-- Mic sample-rate conversion for the mix track uses linear interpolation per buffer. The mic stem
-  is converted by AVFoundation and is unaffected.
-- macOS periodically re-asks you to confirm screen-recording access for apps that bypass the
-  system picker. This applies to every recorder.
+- **Scenes.** There are three fixed scenes with no free layout editor and no transitions. You
+  can only switch live into a camera scene if the recording started with the camera on.
+- **Capture sources.** There is no application capture or multi-display capture. Region capture
+  is CLI-only.
+- **Missing features.** There is no replay buffer, no streaming, no audio filters, and the
+  hotkey isn't configurable.
+- **8-bit SDR only.** HDR displays are tone-mapped by ScreenCaptureKit.
+- **Webcam overlay.** The overlay is burned into the video; there is no separate camera track.
+- **Mix track resampling.** A mic that isn't 48 kHz is resampled linearly per buffer for the mix
+  track. The mic stem is converted by AVFoundation.
+- **Re-confirmation prompt.** macOS periodically asks you to re-confirm screen recording for
+  apps that bypass the system picker. This happens to every recorder.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
 | `src/main.rs` | CLI |
-| `src/gui.rs` | Menu bar app, preview window |
-| `src/hotkey.rs` | Global hotkey (Carbon `RegisterEventHotKey`, no Accessibility permission) |
-| `src/record.rs` | Session orchestration, pacing thread, signals, `rec stop` |
-| `src/screen.rs` | ScreenCaptureKit stream, displays and windows |
-| `src/camera.rs` | Webcam and AVCapture mic, device enumeration |
-| `src/compose.rs` | CoreImage webcam overlay |
+| `src/app/` | App: windows and UI (`ui.rs`), menu bar item and app menu, Dock quit/reopen hooks, preview scaler, theme, macOS chrome |
+| `src/settings.rs` | Persisted settings → record arguments |
+| `src/hotkey.rs` | Global hotkey (Carbon `RegisterEventHotKey`; needs no Accessibility permission) |
+| `src/record.rs` | Sessions, pacing thread, signals, `stop`/`pause`/`resume` |
+| `src/writer.rs` | AVAssetWriter sink, constant-frame-rate grid, pause timeline, track layout |
+| `src/screen.rs` | ScreenCaptureKit capture, displays and windows |
+| `src/camera.rs` | Webcam and AVCapture mic, device lists |
+| `src/compose.rs` | CoreImage scenes and webcam overlay |
 | `src/mixer.rs` | Real-time audio mixer |
-| `src/writer.rs` | AVAssetWriter sink, constant-frame-rate pacing, track layout |
 | `src/tcc.rs` | Permissions and responsibility disclaim |
 | `src/probe.rs` | AVFoundation verification |
-| `src/synth.rs` | Test-pattern source |
-| `support/Info.plist` | Usage strings and bundle ID, also embedded into the binary |
-| `scripts/build.sh` | Build, bundle and sign |
+| `src/synth.rs` | Test pattern with flash + beep |
+| `scripts/` | Build, self-test, soak and sync check |
+| `analysis/OBS_ARCHITECTURE.md` | OBS study |
