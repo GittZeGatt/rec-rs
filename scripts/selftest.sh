@@ -46,15 +46,18 @@ if [ "${1:-}" != "--no-screen" ]; then
   check screen-1080-all   -t 3
   check screen-4k-webcam  -r 4k --webcam -t 3
   check screen-mix.mp4    -t 2 --audio-tracks mix
-  # Menu bar app: scripted preview -> record (same toggle as the hotkey) -> stop -> quit.
-  if REC_GUI_SELFTEST=1 REC_GUI_NO_ALERTS=1 "$REC" gui >"$OUT/gui.log" 2>&1 \
-     && grep -q 'frame_shown=true' "$OUT/gui.log" \
+  # App: scripted preview -> record (the hotkey's command) -> pause/resume
+  # -> stop -> settings window -> hide window -> quit.
+  if REC_GUI_SELFTEST=1 REC_OUTPUT_DIR="$OUT/gui" REC_SETTINGS="$OUT/gui/settings.json" \
+       "$REC" gui >"$OUT/gui.log" 2>&1 \
+     && grep -q 'idle preview session=true frame_shown=true' "$OUT/gui.log" \
+     && grep -q 'paused=true' "$OUT/gui.log" \
+     && grep -q 'settings window=true' "$OUT/gui.log" \
      && f=$(sed -n 's/.*saved=Some("\(.*\)").*/\1/p' "$OUT/gui.log") && [ -n "$f" ] \
      && "$REC" probe "$f" >"$OUT/gui.probe" 2>&1; then
-    echo "PASS  gui-menubar  (preview shown, recording saved and probed)"; pass=$((pass+1))
-    rm -f "$f"
+    echo "PASS  gui-app  (preview, record, pause, saved and probed, settings window)"; pass=$((pass+1))
   else
-    echo "FAIL  gui-menubar  (see $OUT/gui.log)"; fail=$((fail+1))
+    echo "FAIL  gui-app  (see $OUT/gui.log)"; fail=$((fail+1))
   fi
 fi
 echo "$pass passed, $fail failed"
