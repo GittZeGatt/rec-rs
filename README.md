@@ -15,6 +15,13 @@ There is no FFmpeg, no OBS and no Electron, and the binary is a few MB.
 
 Requires macOS 15 or later on Apple Silicon. It was developed on macOS 27 with an M4 Pro.
 
+## Reverse-engineered origin
+
+rec-rs is an independent, clean-room-style reimplementation. It was reverse engineered from
+[OBS Studio](https://obsproject.com) by studying its architecture and behavior with
+[REA](https://github.com/morluto/rea) and Claude Code. It is not affiliated with or endorsed by
+the OBS Project. No original OBS code or assets are included in this repository.
+
 ## Build
 
 ```sh
