@@ -661,7 +661,7 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
     lock.lock().unwrap().state = "stopped".into();
 }
 
-fn sleep_unless_stopped(stop: &AtomicBool, d: Duration) {
+pub(super) fn sleep_unless_stopped(stop: &AtomicBool, d: Duration) {
     let end = Instant::now() + d;
     while Instant::now() < end && !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(50));
