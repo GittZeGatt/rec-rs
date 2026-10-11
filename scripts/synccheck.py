@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--max-ms", type=float, default=20.0)
     ap.add_argument("--region", help="x,y,w,h as fractions of the frame")
     ap.add_argument("--audio", help="audio track indexes to check (default: all with beeps)")
+    ap.add_argument("-v", action="store_true", help="print every flash/beep pair")
     a = ap.parse_args()
     region = [float(v) for v in a.region.split(",")] if a.region else None
     streams = probe(a.file)
@@ -73,8 +74,10 @@ def main():
         offs = []
         for f in fl:
             b = min(on, key=lambda t: abs(t - f))
-            if abs(b - f) < 0.5:
+            if abs(b - f) < 0.2:
                 offs.append((b - f) * 1000)
+                if a.v:
+                    print(f"  flash {f:7.3f}s  beep {b:7.3f}s  {1000*(b-f):+6.1f} ms")
         if not offs:
             print(f"audio {i}: {len(on)} beeps, none near a flash")
             ok = False
