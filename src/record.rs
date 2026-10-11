@@ -376,7 +376,8 @@ pub fn stop_running() -> Result<()> {
     }
     unsafe { libc::kill(pid, libc::SIGINT) };
     let deadline = Instant::now() + Duration::from_secs(90);
-    while unsafe { libc::kill(pid, 0) } == 0 {
+    // Done when the recorder removes its pidfile (file finalized) or exits.
+    while unsafe { libc::kill(pid, 0) } == 0 && path.exists() {
         if Instant::now() > deadline {
             bail!("recorder (pid {pid}) did not exit within 90s");
         }

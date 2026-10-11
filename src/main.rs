@@ -1,5 +1,7 @@
 mod camera;
 mod compose;
+mod gui;
+mod hotkey;
 mod mixer;
 mod probe;
 mod record;
@@ -20,14 +22,22 @@ use writer::Codec;
 #[derive(Parser)]
 #[command(name = "rec", version, about = "Native macOS screen recorder (ScreenCaptureKit + VideoToolbox + AVAssetWriter)")]
 struct Cli {
+    /// Without a subcommand, rec starts the menu bar app.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
     /// Record the screen (plus system audio, mic, and optional webcam overlay).
     Record(RecordArgs),
+    /// Menu bar app with live preview and a global Cmd+Shift+R hotkey
+    /// (also what `open dist/Rec.app` starts).
+    Gui {
+        /// Start recording immediately (e.g. from a Login Item or script).
+        #[arg(long)]
+        start_recording: bool,
+    },
     /// List displays, windows, cameras and microphones.
     Devices,
     /// Stop a running `rec record` (e.g. from a hotkey) and print its file.
@@ -46,7 +56,7 @@ enum Cmd {
 }
 
 #[derive(Args)]
-struct RecordArgs {
+pub struct RecordArgs {
     /// Output file (.mov or .mp4). Default: ~/Movies/rec-<timestamp>.mov
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -171,7 +181,9 @@ fn default_output() -> PathBuf {
     dir.join(name)
 }
 
-fn record(a: RecordArgs) -> Result<()> {
+/// Turn record arguments into session options and a capture target
+/// (shared by the CLI and the GUI).
+pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>)> {
     let mic = if a.no_mic {
         None
     } else {
@@ -256,6 +268,21 @@ fn record(a: RecordArgs) -> Result<()> {
         && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
+    Ok((opts, target))
+}
+
+/// Parse a `rec record ...` argument list (used by the GUI).
+pub fn parse_record_args(args: &[&str]) -> Result<RecordArgs> {
+    let mut v = vec!["rec", "record"];
+    v.extend_from_slice(args);
+    match Cli::try_parse_from(v)?.cmd {
+        Some(Cmd::Record(a)) => Ok(a),
+        _ => bail!("internal: not a record command"),
+    }
+}
+
+fn record(a: RecordArgs) -> Result<()> {
+    let (opts, target) = prepare(a)?;
     let out = opts.output.clone();
     let quiet = opts.quiet;
     let stats = record::run(opts, target)?;
@@ -327,7 +354,8 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     tcc::disclaim_and_reexec();
     let cli = Cli::parse();
-    let r = match cli.cmd {
+    let r = match cli.cmd.unwrap_or(Cmd::Gui { start_recording: false }) {
+        Cmd::Gui { start_recording } => gui::run(start_recording),
         Cmd::Record(a) => record(a),
         Cmd::Devices => devices(),
         Cmd::Stop => record::stop_running(),

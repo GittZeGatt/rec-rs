@@ -359,6 +359,9 @@ impl Sink {
     }
 
     /// Emit every grid slot whose time is at or before `until` (host seconds).
+    // `compositor.unwrap()` follows an `is_some` check because the output
+    // buffer must be taken (borrowing self) before the compositor is borrowed.
+    #[allow(clippy::unnecessary_unwrap)]
     pub fn emit_until(&mut self, until: f64) {
         if self.t0.is_none() || self.failed.is_some() {
             return;
