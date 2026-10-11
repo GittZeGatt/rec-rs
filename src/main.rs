@@ -2,6 +2,7 @@ mod app;
 mod camera;
 mod compose;
 mod hotkey;
+mod live;
 mod mixer;
 mod outlatency;
 mod play;
@@ -53,6 +54,18 @@ enum Cmd {
     Devices,
     /// Stop a running recording (CLI or app) and print its file.
     Stop,
+    /// Save the replay buffer of the running recorder (CLI or app) to MP4.
+    SaveReplay,
+    /// Store a stream key in the macOS Keychain for a destination (reads the
+    /// key from stdin; never echoed or logged).
+    StreamKey {
+        /// Stream URL (rtmp://, rtmps://, https://.../whip) or a service:
+        /// youtube, twitch.
+        dest: String,
+        /// Remove the stored key instead.
+        #[arg(long)]
+        delete: bool,
+    },
     /// Pause the running recording (resume with `rec-rs resume`).
     Pause,
     /// Resume a paused recording.
@@ -181,6 +194,33 @@ pub struct RecordArgs {
     /// Shift the microphone later by this many ms (e.g. a Bluetooth mic).
     #[arg(long, value_name = "MS", default_value_t = 0.0, allow_hyphen_values = true)]
     mic_offset_ms: f64,
+    /// Keep the last SECS seconds (15-300) of encoded video and audio in
+    /// memory; `rec-rs save-replay` writes them to an MP4.
+    #[arg(long, value_name = "SECS")]
+    replay: Option<f64>,
+    /// Stream to an RTMP(S) URL or a WHIP endpoint (http(s)://.../whip).
+    /// youtube and twitch are shortcuts. The key comes from
+    /// $REC_STREAM_KEY or the Keychain (`rec-rs stream-key URL`).
+    #[arg(long, value_name = "URL")]
+    stream: Vec<String>,
+    /// Do not write a recording file (replay buffer / streaming only).
+    #[arg(long)]
+    no_record: bool,
+    /// Live encode (replay and streams) size.
+    #[arg(long, default_value = "1080p")]
+    live_resolution: String,
+    /// Live video bitrate in kb/s.
+    #[arg(long, default_value_t = 6000)]
+    stream_bitrate: u32,
+    /// Live keyframe interval in seconds.
+    #[arg(long, default_value_t = 2.0)]
+    keyframe: f64,
+    /// Variable bitrate for the live encode (default: constant).
+    #[arg(long)]
+    vbr: bool,
+    /// Live audio bitrate in kb/s.
+    #[arg(long, default_value_t = 160)]
+    audio_bitrate: u32,
     /// System audio gain in the mix track (dB).
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     system_gain: f32,
@@ -225,6 +265,41 @@ fn parse_size(s: &str, native: (usize, usize), keep_aspect: bool) -> Result<(usi
     }
     let s = (boxed.0 as f64 / native.0 as f64).min(boxed.1 as f64 / native.1 as f64);
     Ok((even(native.0 as f64 * s), even(native.1 as f64 * s)))
+}
+
+/// `rec-rs stream-key DEST`: store (or delete) a stream key in the Keychain.
+fn stream_key(dest: &str, delete: bool) -> Result<()> {
+    let url = live::destination_url(dest);
+    if delete {
+        live::keychain::delete(&url)?;
+        println!("removed the stream key for {url}");
+        return Ok(());
+    }
+    let tty = unsafe { libc::isatty(0) } == 1;
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    if tty {
+        eprint!("stream key for {url}: ");
+        unsafe {
+            libc::tcgetattr(0, &mut old);
+            let mut t = old;
+            t.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+    }
+    let mut key = String::new();
+    let r = std::io::stdin().read_line(&mut key);
+    if tty {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+        eprintln!();
+    }
+    r?;
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("no key given");
+    }
+    live::keychain::set(&url, key)?;
+    println!("saved the stream key for {url} in the Keychain");
+    Ok(())
 }
 
 fn parse_pos(s: &str) -> Result<[f64; 2]> {
@@ -303,6 +378,9 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         scene,
         system_offset_ms: a.system_audio_offset_ms,
         mic_offset_ms: a.mic_offset_ms,
+        write: !a.no_record,
+        live: None,
+        streams: vec![],
     };
     record::check_permissions(&opts)?;
     if !(1..=240).contains(&a.fps) || 60000 % a.fps != 0 {
@@ -354,6 +432,31 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         bail!("ProRes needs a .mov output");
     }
     opts.size = (w, h);
+    if a.no_record && a.replay.is_none() && a.stream.is_empty() {
+        bail!("--no-record needs --replay or --stream");
+    }
+    if a.replay.is_some() || !a.stream.is_empty() {
+        let live = live::Live::new();
+        let (lw, lh) = parse_size(&a.live_resolution, (w, h), false)?;
+        live.set_config(live::LiveConfig {
+            width: lw.min(w),
+            height: lh.min(h),
+            bitrate: a.stream_bitrate.clamp(500, 50_000) as u64 * 1000,
+            keyframe_secs: a.keyframe.clamp(0.5, 4.0),
+            cbr: !a.vbr,
+            audio_bitrate: a.audio_bitrate.clamp(64, 320) * 1000,
+        });
+        if let Some(secs) = a.replay {
+            if !(15.0..=300.0).contains(&secs) {
+                bail!("--replay must be 15-300 seconds");
+            }
+            live.set_replay(Some(secs));
+        }
+        for dest in &a.stream {
+            opts.streams.push(live::resolve_destination(dest)?);
+        }
+        opts.live = Some(live);
+    }
     opts.codec = codec;
     opts.bitrate = bitrate;
     if let Some(parent) = opts.output.parent()
@@ -377,7 +480,14 @@ fn record(a: RecordArgs) -> Result<()> {
     let (opts, target) = prepare(a)?;
     let out = opts.output.clone();
     let quiet = opts.quiet;
+    let wrote = opts.write;
     let stats = record::run(opts, target)?;
+    if !wrote {
+        if !quiet {
+            eprintln!("rec: stopped ({} video frames, {} dropped)", stats.video_frames_out, stats.video_drops);
+        }
+        return Ok(());
+    }
     if !quiet {
         eprintln!(
             "rec: saved {} ({} video frames, {} duplicated, {} dropped; audio buffers sys {} mic {} mix {}, {} dropped, {} clipped samples)",
@@ -464,8 +574,10 @@ fn main() {
             r
         }
         Cmd::Stop => record::stop_running(),
-        Cmd::Pause => record::signal_running(true),
-        Cmd::Resume => record::signal_running(false),
+        Cmd::Pause => record::signal_running(libc::SIGUSR1),
+        Cmd::Resume => record::signal_running(libc::SIGUSR2),
+        Cmd::SaveReplay => record::signal_running(libc::SIGINFO),
+        Cmd::StreamKey { dest, delete } => stream_key(&dest, delete),
         Cmd::Permissions { request, wait } => {
             if request {
                 tcc::request_all(true, true, true, std::time::Duration::from_secs(wait));

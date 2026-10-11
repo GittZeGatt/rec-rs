@@ -223,6 +223,8 @@ pub struct Sink {
     /// Decaying peak arrival latency [screen, camera] and when it was set.
     latency_peak: [f64; 2],
     latency_at: [f64; 2],
+    /// Shared live encode (replay buffer, streams).
+    live: Option<std::sync::Arc<crate::live::Live>>,
     screen_q: VecDeque<(f64, Pb)>,
     screen_last: Option<Pb>,
     cam_q: VecDeque<(f64, Pb)>,
@@ -290,7 +292,7 @@ fn video_settings(v: &VideoSpec) -> Retained<Dict> {
     }
 }
 
-fn audio_settings(channels: i64, bitrate: i64) -> Retained<Dict> {
+pub fn audio_settings(channels: i64, bitrate: i64) -> Retained<Dict> {
     // Key constants live in AVFAudio; their values equal their names.
     dict(vec![
         (&*ns("AVFormatIDKey"), num_i(fourcc(b"aac ") as i64)),
@@ -339,6 +341,7 @@ impl Sink {
             limit: None,
             audio_next: [None; 2],
             preroll: VecDeque::new(),
+            live: None,
             latency_peak: [0.0; 2],
             latency_at: [0.0; 2],
             audio_offset: [0.0; 2],
@@ -431,6 +434,10 @@ impl Sink {
         self.pauses.is_paused()
     }
 
+    pub fn set_live(&mut self, live: std::sync::Arc<crate::live::Live>) {
+        self.live = Some(live);
+    }
+
     /// Change the camera overlay live (no-op without a webcam).
     pub fn set_pip(&mut self, pip: crate::compose::PipSpec) {
         if let Some(c) = self.compositor.as_mut() {
@@ -515,6 +522,11 @@ impl Sink {
         let real_s = secs(pts);
         let pts_s = real_s + self.audio_offset[i];
         let decoded = crate::mixer::decode(sb);
+        if let (Some(l), Some((_, rate, frames))) = (&self.live, &decoded)
+            && l.active()
+        {
+            l.audio(kind, pts_s, *rate, frames.clone());
+        }
         if let Some((_, _, frames)) = &decoded {
             let peak = frames.iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
             self.levels[i] = self.levels[i].max(peak);
@@ -706,9 +718,12 @@ impl Sink {
                 self.stats.paused_slots += 1;
             }
             let want_preview = self.preview.is_some() && slot_t - self.last_preview >= 1.0 / 30.0;
-            if !write && !want_preview {
+            // The replay buffer and streams get every frame, paused or not.
+            let want_live = self.live.as_ref().is_some_and(|l| l.active());
+            if !write && !want_preview && !want_live {
                 continue;
             }
+            let mut write = write;
             let screen = self.screen_last.as_ref().map(|s| s.0.clone());
             if screen.is_none() && self.scene != Scene::Cam {
                 continue;
@@ -720,7 +735,10 @@ impl Sink {
                 self.stats.video_drops += 1;
                 self.out_slot += 1;
                 self.check_writer();
-                continue;
+                write = false;
+                if !want_preview && !want_live {
+                    continue;
+                }
             }
             let frame: CFRetained<CVPixelBuffer> = if self.compositor.is_some() {
                 let Some(buf) = self.new_output_buffer() else {
@@ -753,6 +771,9 @@ impl Sink {
                 } else {
                     self.stats.video_frames_out += 1;
                 }
+            }
+            if want_live && let Some(l) = &self.live {
+                l.video(&frame, slot_t, self.fps as u32);
             }
             if want_preview && let Some(p) = &self.preview {
                 self.last_preview = slot_t;
@@ -935,6 +956,13 @@ fn silence_like(like: &CMSampleBuffer, frames: usize, pts: CMTime) -> Option<CFR
         }
         std::ptr::NonNull::new(out).map(|b| CFRetained::from_raw(b))
     }
+}
+
+/// Copy of a sample buffer with timestamps moved `shift` ticks
+/// (1/TIMESCALE s) earlier.
+pub fn shifted(sb: &CMSampleBuffer, shift: i64) -> Option<CFRetained<CMSampleBuffer>> {
+    let n = unsafe { sb.num_samples() } as usize;
+    retime(sb, 0, n, shift)
 }
 
 /// Copy samples `[i0, i1)` of an audio buffer with timestamps moved `shift`

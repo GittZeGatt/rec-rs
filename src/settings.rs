@@ -87,6 +87,18 @@ impl Default for Settings {
     }
 }
 
+/// `PREFIX-YYYY-MM-DD-HHMMSS.EXT` in local time.
+pub fn timestamped(prefix: &str, ext: &str) -> String {
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        libc::strftime(buf.as_mut_ptr() as *mut _, buf.len(), c"%Y-%m-%d-%H%M%S".as_ptr(), &tm)
+    };
+    format!("{prefix}-{}.{ext}", String::from_utf8_lossy(&buf[..n]))
+}
+
 pub fn default_output_dir() -> PathBuf {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Movies")).unwrap_or_default()
 }
@@ -158,15 +170,8 @@ impl Settings {
 
     /// A fresh timestamped file in the output folder.
     pub fn new_output_file(&self) -> PathBuf {
-        let mut buf = [0u8; 64];
-        let n = unsafe {
-            let t = libc::time(std::ptr::null_mut());
-            let mut tm: libc::tm = std::mem::zeroed();
-            libc::localtime_r(&t, &mut tm);
-            libc::strftime(buf.as_mut_ptr() as *mut _, buf.len(), c"rec-%Y-%m-%d-%H%M%S".as_ptr(), &tm)
-        };
         let ext = if self.container == "mp4" && self.codec != Some(Codec::Prores) { "mp4" } else { "mov" };
-        self.output_dir.join(format!("{}.{ext}", String::from_utf8_lossy(&buf[..n])))
+        self.output_dir.join(timestamped("rec", ext))
     }
 
     /// `rec-rs record` arguments for these settings (`output` None = preview).

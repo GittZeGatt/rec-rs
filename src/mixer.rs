@@ -168,9 +168,8 @@ impl Mixer {
         }
     }
 
-    /// Mixed PCM ready to encode: everything all active sources have reached,
-    /// or anything older than MAX_WAIT behind the newest source.
-    pub fn pull(&mut self, flush: bool) -> Option<CFRetained<CMSampleBuffer>> {
+    /// Mixed frames ready (see `pull`) with their start time in host seconds.
+    pub fn pull_frames(&mut self, flush: bool) -> Option<(f64, Vec<[f32; 2]>)> {
         let hs: Vec<i64> = (0..2).filter(|&i| self.active[i]).map(|i| self.horizon[i].unwrap_or(0)).collect();
         let max_h = hs.iter().copied().max().unwrap_or(0);
         let until = if flush { max_h } else { hs.iter().copied().min().unwrap_or(0).max(max_h - MAX_WAIT) };
@@ -178,18 +177,29 @@ impl Mixer {
         if n <= 0 {
             return None;
         }
-        let n = n as usize;
-        let mut data: Vec<f32> = Vec::with_capacity(n * 2);
-        for fr in self.buf.drain(..n) {
-            for s in fr {
-                if s.abs() > 1.0 {
-                    self.clipped += 1;
-                }
-                data.push(s.clamp(-1.0, 1.0));
-            }
-        }
-        let pts = unsafe { CMTime::new(self.t0 + self.base, RATE as i32) };
-        self.base += n as i64;
+        let t = (self.t0 + self.base) as f64 / RATE;
+        self.base += n;
+        let frames = self
+            .buf
+            .drain(..n as usize)
+            .map(|fr| {
+                fr.map(|s| {
+                    if s.abs() > 1.0 {
+                        self.clipped += 1;
+                    }
+                    s.clamp(-1.0, 1.0)
+                })
+            })
+            .collect();
+        Some((t, frames))
+    }
+
+    /// Mixed PCM ready to encode: everything all active sources have reached,
+    /// or anything older than MAX_WAIT behind the newest source.
+    pub fn pull(&mut self, flush: bool) -> Option<CFRetained<CMSampleBuffer>> {
+        let (t, frames) = self.pull_frames(flush)?;
+        let data: Vec<f32> = frames.into_iter().flatten().collect();
+        let pts = unsafe { CMTime::new((t * RATE).round() as i64, RATE as i32) };
         pcm_buffer(&self.fmt, data, pts)
     }
 }

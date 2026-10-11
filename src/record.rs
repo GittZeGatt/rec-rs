@@ -42,6 +42,12 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// Pause/resume requests (SIGUSR1/SIGUSR2 from `rec-rs pause`/`resume`).
 pub static PAUSE_REQ: AtomicBool = AtomicBool::new(false);
 pub static RESUME_REQ: AtomicBool = AtomicBool::new(false);
+/// Save-replay request (SIGINFO from `rec-rs save-replay`).
+pub static REPLAY_REQ: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_info_signal(_: libc::c_int) {
+    REPLAY_REQ.store(true, Ordering::SeqCst);
+}
 
 pub extern "C" fn on_pause_signal(sig: libc::c_int) {
     if sig == libc::SIGUSR1 {
@@ -55,6 +61,7 @@ pub fn install_pause_signals() {
     unsafe {
         libc::signal(libc::SIGUSR1, on_pause_signal as *const () as usize);
         libc::signal(libc::SIGUSR2, on_pause_signal as *const () as usize);
+        libc::signal(libc::SIGINFO, on_info_signal as *const () as usize);
     }
 }
 static SIGNALS: AtomicI32 = AtomicI32::new(0);
@@ -93,6 +100,12 @@ pub struct Options {
     pub system_offset_ms: Option<f64>,
     /// Microphone offset in ms.
     pub mic_offset_ms: f64,
+    /// Write the recording file (false: replay buffer / streams only).
+    pub write: bool,
+    /// Shared live encode for the replay buffer and streams.
+    pub live: Option<Arc<crate::live::Live>>,
+    /// Stream destinations (URL, key) to start with the session.
+    pub streams: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -160,6 +173,10 @@ impl Session {
             eprintln!("rec: debug: audio offsets: system {sys_ms:+.1} ms, mic {:+.1} ms", o.mic_offset_ms);
         }
         sink.set_audio_offsets([sys_ms / 1000.0, o.mic_offset_ms / 1000.0]);
+        if let Some(l) = &o.live {
+            l.begin_session(o.system_audio, o.mic.is_some());
+            sink.set_live(l.clone());
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None), stop: stop.clone() });
         let mut sess = Session {
@@ -386,7 +403,19 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
     install_pause_signals();
     let pidfile = pidfile_path();
     let _ = std::fs::write(&pidfile, format!("{}\n{}\n", std::process::id(), o.output.display()));
-    let sess = match Session::start(&o, target, true, None) {
+    let mut stream_ids = vec![];
+    if let Some(l) = &o.live {
+        for (url, key) in &o.streams {
+            match crate::live::start_output(url, key) {
+                Ok(out) => stream_ids.push(l.add_output(out)),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&pidfile);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    let sess = match Session::start(&o, target, o.write, None) {
         Ok(s) => s,
         Err(e) => {
             let _ = std::fs::remove_file(&pidfile);
@@ -396,9 +425,10 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
     let (w, h) = o.size;
     if !o.quiet {
         eprintln!(
-            "rec: recording {} -> {} ({}x{} @ {}fps {:?}{}, system audio {}, mic {}, webcam {})",
+            "rec: {} {} -> {} ({}x{} @ {}fps {:?}{}, system audio {}, mic {}, webcam {})",
+            if o.write { "recording" } else { "capturing" },
             sess.description,
-            o.output.display(),
+            if o.write { o.output.display().to_string() } else { "no file".into() },
             w,
             h,
             o.fps,
@@ -414,6 +444,7 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
 
     let mut last_status = Instant::now();
     let mut warned_no_frames = false;
+    let mut saves: Vec<std::thread::JoinHandle<Result<PathBuf>>> = vec![];
     while !STOP.load(Ordering::SeqCst) && !sess.failed() {
         std::thread::sleep(Duration::from_millis(20));
         // Requests wait for the first frame (the timeline starts there).
@@ -422,6 +453,26 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
         }
         if sess.has_frames() && RESUME_REQ.swap(false, Ordering::SeqCst) && sess.resume() && !o.quiet {
             eprint!("\r\x1b[2Krec: resumed\n");
+        }
+        if REPLAY_REQ.swap(false, Ordering::SeqCst)
+            && let Some(l) = &o.live
+        {
+            let dir = o.output.parent().map(PathBuf::from).unwrap_or_default();
+            match l.save_replay(dir.join(crate::settings::timestamped("replay", "mp4"))) {
+                Ok(h) => saves.push(h),
+                Err(e) => eprint!("\r\x1b[2Krec: replay: {e:#}\n"),
+            }
+        }
+        for h in std::mem::take(&mut saves) {
+            if h.is_finished() {
+                match h.join() {
+                    Ok(Ok(p)) => eprint!("\r\x1b[2Krec: replay saved {}\n", p.display()),
+                    Ok(Err(e)) => eprint!("\r\x1b[2Krec: replay: {e:#}\n"),
+                    Err(_) => eprint!("\r\x1b[2Krec: replay: writer panicked\n"),
+                }
+            } else {
+                saves.push(h);
+            }
         }
         let el = sess.started.elapsed().as_secs_f64();
         // --duration counts recorded time, so pauses extend the wall time.
@@ -438,8 +489,17 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
         if !o.quiet && last_status.elapsed() >= Duration::from_secs(1) {
             last_status = Instant::now();
             let (st, lv) = sess.poll();
+            let mut live = String::new();
+            if let Some(l) = &o.live {
+                if let Some((secs, bytes)) = l.replay_stats() {
+                    live += &format!("  replay {:.0}s {:.1} MB", secs, bytes as f64 / 1e6);
+                }
+                for (_, s) in l.statuses() {
+                    live += &format!("  {} {} {:.1} Mb/s drop {}", s.name, s.state, s.bitrate / 1e6, s.dropped_frames);
+                }
+            }
             eprint!(
-                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB  ",
+                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB{live}  ",
                 clock(rec_t),
                 if sess.is_paused() { " PAUSED" } else { "" },
                 st.video_frames_out,
@@ -454,6 +514,18 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
         eprintln!("\nrec: stopping...");
     }
     let result = sess.finish();
+    if let Some(l) = &o.live {
+        for id in stream_ids {
+            l.remove_output(id);
+        }
+    }
+    for h in saves {
+        match h.join() {
+            Ok(Ok(p)) => eprintln!("rec: replay saved {}", p.display()),
+            Ok(Err(e)) => eprintln!("rec: replay: {e:#}"),
+            Err(_) => {}
+        }
+    }
     let _ = std::fs::remove_file(&pidfile);
     result
 }
@@ -471,11 +543,11 @@ pub fn pidfile_path() -> PathBuf {
     std::env::temp_dir().join("rec.pid")
 }
 
-/// Send SIGUSR1 (pause) or SIGUSR2 (resume) to the running recorder.
-pub fn signal_running(pause: bool) -> Result<()> {
+/// Send `sig` to the running recorder (SIGUSR1 pause, SIGUSR2 resume,
+/// SIGINFO save replay).
+pub fn signal_running(sig: libc::c_int) -> Result<()> {
     let text = std::fs::read_to_string(pidfile_path()).map_err(|_| anyhow::anyhow!("no recording in progress"))?;
     let pid: i32 = text.lines().next().unwrap_or("").trim().parse()?;
-    let sig = if pause { libc::SIGUSR1 } else { libc::SIGUSR2 };
     if unsafe { libc::kill(pid, sig) } != 0 {
         bail!("no recording in progress (pid {pid} not running)");
     }
