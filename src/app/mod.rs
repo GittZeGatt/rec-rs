@@ -865,9 +865,10 @@ impl SelfTest {
             3 if t > 8.0 => {
                 println!("selftest: preview during recording frame_shown={}", app.st.frames_shown > 0);
                 println!(
-                    "selftest: status title={:?} recorded={:.2}s",
+                    "selftest: status title={:?} recorded={:.2}s wall={:.2}s",
                     app.menubar.as_ref().and_then(|m| m.title()),
-                    app.st.recording.as_ref().map_or(0.0, |s| s.recorded_secs())
+                    app.st.recording.as_ref().map_or(0.0, |s| s.recorded_secs()),
+                    app.st.recording.as_ref().map_or(0.0, |s| s.started.elapsed().as_secs_f64())
                 );
                 push(Cmd::ToggleRecording);
                 self.step = 4;

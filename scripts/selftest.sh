@@ -81,8 +81,21 @@ elif [ "${1:-}" != "--no-screen" ]; then
      && grep -q 'settings window=true' "$OUT/gui.log" \
      && grep -q 'overlay change live=true applied=true' "$OUT/gui.log" \
      && f=$(sed -n 's/.*saved=Some("\(.*\)").*/\1/p' "$OUT/gui.log") && [ -n "$f" ] \
-     && "$REC" probe "$f" >"$OUT/gui.probe" 2>&1; then
-    echo "PASS  gui-app  (preview, record, pause, saved and probed, settings window, live overlay change)"; pass=$((pass+1))
+     && "$REC" probe "$f" >"$OUT/gui.probe" 2>&1 \
+     && python3 - "$OUT/gui.log" "$f" <<'PY'
+import re, subprocess, sys
+log = open(sys.argv[1]).read()
+rec, wall = map(float, re.search(r"recorded=([\d.]+)s wall=([\d.]+)s", log).groups())
+dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", sys.argv[2]],
+                           capture_output=True, text=True).stdout)
+# The 1.5 s pause must be cut out of the file, and the file must match
+# the recorded clock (it keeps running a few frames until the stop).
+ok = dur < wall - 1.2 and abs(dur - rec) < 0.4
+print(f"pause check: file {dur:.2f}s, recorded clock {rec:.2f}s, wall {wall:.2f}s -> {'ok' if ok else 'FAIL'}")
+sys.exit(0 if ok else 1)
+PY
+  then
+    echo "PASS  gui-app  (preview, record, pause, saved and probed, pause cut from file, settings window, live overlay change)"; pass=$((pass+1))
   else
     echo "FAIL  gui-app  (see $OUT/gui.log)"; fail=$((fail+1))
   fi
