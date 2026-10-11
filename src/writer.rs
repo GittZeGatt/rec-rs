@@ -690,8 +690,8 @@ fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout
         let writer = AVAssetWriter::initWithURL_fileType_error(AVAssetWriter::alloc(), &url, file_type)
             .map_err(|e| anyhow!("AVAssetWriter: {}", e.localizedDescription()))?;
         // Fragmented writing: a crash or power loss leaves a playable file
-        // up to the last fragment instead of an unreadable one.
-        writer.setMovieFragmentInterval(CMTime::new(5 * TIMESCALE as i64, TIMESCALE));
+        // up to the last fragment (at most 2 s, one keyframe interval, old).
+        writer.setMovieFragmentInterval(CMTime::new(2 * TIMESCALE as i64, TIMESCALE));
 
         let video = AVAssetWriterInput::initWithMediaType_outputSettings(
             AVAssetWriterInput::alloc(),

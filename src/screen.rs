@@ -259,7 +259,9 @@ impl ScreenCapture {
             };
             conf.setWidth(cfg.width);
             conf.setHeight(cfg.height);
-            conf.setMinimumFrameInterval(CMTime::new(1, cfg.fps as i32));
+            // Slightly under the frame period, so capture jitter never makes
+            // ScreenCaptureKit skip a frame the pacer needs (as OBS does).
+            conf.setMinimumFrameInterval(CMTime::new(9, cfg.fps as i32 * 10));
             conf.setPixelFormat(cfg.pixel_format);
             conf.setQueueDepth(8);
             conf.setShowsCursor(cfg.cursor);

@@ -20,6 +20,12 @@
 	<string>15.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<!-- Never throttle the frame pacer when no window is visible. -->
+	<key>LSAppNapIsDisabled</key>
+	<true/>
+	<!-- Keep macOS camera reactions (balloons etc.) out of the overlay. -->
+	<key>NSCameraReactionEffectGesturesEnabledDefault</key>
+	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>Rec records your webcam into screen recordings.</string>
 	<key>NSMicrophoneUsageDescription</key>

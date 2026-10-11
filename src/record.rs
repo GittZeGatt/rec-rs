@@ -128,6 +128,8 @@ pub struct Session {
     synth: Option<Synth>,
     cam: Option<Camera>,
     av_mic: Option<Mic>,
+    /// Keeps App Nap and timer coalescing off while capturing.
+    activity: Option<SendBox<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>>,
     pub output: Option<PathBuf>,
     pub started: Instant,
     pub description: String,
@@ -153,6 +155,7 @@ impl Session {
             synth: None,
             cam: None,
             av_mic: None,
+            activity: None,
             output: write.then(|| o.output.clone()),
             started: Instant::now(),
             description: String::new(),
@@ -194,6 +197,12 @@ impl Session {
                 std::thread::sleep(period);
             }
         }));
+        use objc2_foundation::{NSActivityOptions, NSProcessInfo};
+        let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+            NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical,
+            &ns("screen recording"),
+        );
+        sess.activity = Some(SendBox(token));
         sess.started = Instant::now();
         Ok(sess)
     }
@@ -317,6 +326,9 @@ impl Session {
             let _ = p.join();
         }
         let stop_err = self.stop_sources();
+        if let Some(t) = self.activity.take() {
+            unsafe { objc2_foundation::NSProcessInfo::processInfo().endActivity(&t.0) };
+        }
         let sink = self.shared.sink.lock().unwrap().take();
         let result = match sink {
             Some(s) => objc2::rc::autoreleasepool(|_| s.finish(end)),
