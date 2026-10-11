@@ -157,3 +157,61 @@ impl MenuBar {
         button.setTitle(&ns(&title));
     }
 }
+
+/// The app's main menu (it has a Dock icon, so it needs a menu bar):
+/// Rec (About, Settings…, Hide, Quit) and Window (Minimize, Close, Show).
+/// Settings, Show and Quit go through `Cmd`s; the rest are standard
+/// first-responder actions.
+pub fn install_main_menu(mtm: MainThreadMarker) -> Retained<Target> {
+    let target = Target::new(mtm);
+    let item = |title: &str, action: Option<Sel>, key: &str, ours: bool| {
+        let it = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &ns(title), action, &ns(key))
+        };
+        if ours {
+            unsafe { it.setTarget(Some(&target)) };
+        }
+        it
+    };
+    let submenu = |title: &str, items: Vec<Retained<NSMenuItem>>| {
+        let m = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns(title));
+        for it in &items {
+            m.addItem(it);
+        }
+        let parent = item(title, None, "", false);
+        parent.setSubmenu(Some(&m));
+        (parent, m)
+    };
+    let hide_others = item("Hide Others", Some(sel!(hideOtherApplications:)), "h", false);
+    hide_others.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    let (app_item, _) = submenu(
+        "Rec",
+        vec![
+            item("About Rec", Some(sel!(orderFrontStandardAboutPanel:)), "", false),
+            NSMenuItem::separatorItem(mtm),
+            item("Settings…", Some(sel!(showSettings:)), ",", true),
+            NSMenuItem::separatorItem(mtm),
+            item("Hide Rec", Some(sel!(hide:)), "h", false),
+            hide_others,
+            item("Show All", Some(sel!(unhideAllApplications:)), "", false),
+            NSMenuItem::separatorItem(mtm),
+            item("Quit Rec", Some(sel!(quit:)), "q", true),
+        ],
+    );
+    let (win_item, win_menu) = submenu(
+        "Window",
+        vec![
+            item("Minimize", Some(sel!(performMiniaturize:)), "m", false),
+            item("Close", Some(sel!(performClose:)), "w", false),
+            NSMenuItem::separatorItem(mtm),
+            item("Show Rec Window", Some(sel!(showWindow:)), "0", true),
+        ],
+    );
+    let main = NSMenu::new(mtm);
+    main.addItem(&app_item);
+    main.addItem(&win_item);
+    let app = NSApplication::sharedApplication(mtm);
+    app.setMainMenu(Some(&main));
+    app.setWindowsMenu(Some(&win_menu));
+    target
+}

@@ -3,6 +3,7 @@
 //! with a transparent titlebar and Inter (the paper-rs look). ⇧⌘R toggles
 //! recording from anywhere.
 
+mod dock;
 mod macos;
 mod menubar;
 mod preview;
@@ -161,6 +162,7 @@ struct App {
     main_visible: bool,
     st: State,
     menubar: Option<menubar::MenuBar>,
+    _main_menu: Option<objc2::rc::Retained<menubar::Target>>,
     scaler: preview::Scaler,
     last_tick: Instant,
     last_meter: Instant,
@@ -221,6 +223,7 @@ impl App {
             main_visible: true,
             st,
             menubar: None,
+            _main_menu: None,
             scaler: preview::Scaler::new(),
             last_tick: Instant::now(),
             last_meter: Instant::now(),
@@ -450,7 +453,11 @@ impl App {
 
     fn quit(&mut self, el: &ActiveEventLoop) {
         if let Some(s) = self.st.recording.take() {
-            let _ = objc2::rc::autoreleasepool(|_| s.finish());
+            let file = s.output.clone();
+            let r = objc2::rc::autoreleasepool(|_| s.finish());
+            if self.selftest.is_some() {
+                println!("selftest: saved on quit={file:?} ok={}", r.is_ok());
+            }
             let _ = std::fs::remove_file(record::pidfile_path());
         }
         while self.st.finishing && self.finished.lock().unwrap().is_none() {
@@ -459,6 +466,7 @@ impl App {
         if let Some(s) = self.st.preview.take() {
             let _ = s.finish();
         }
+        dock::allow_terminate();
         el.exit();
     }
 
@@ -657,6 +665,8 @@ impl ApplicationHandler for App {
             self.st.hotkey_ok = false;
         }
         self.menubar = Some(mb);
+        self._main_menu = Some(menubar::install_main_menu(mtm));
+        macos::set_dock_icon();
         if std::env::var_os("REC_GUI_HIDDEN").is_some() {
             self.main_visible = false;
         } else {
@@ -762,6 +772,24 @@ struct SelfTest {
 impl SelfTest {
     fn step(&mut self, app: &mut App) {
         let t = self.t0.get_or_insert_with(Instant::now).elapsed().as_secs_f64();
+        // REC_GUI_SELFTEST=terminate: quit the way the Dock does
+        // (-[NSApp terminate:]) mid-recording; the file must be finalized.
+        if std::env::var("REC_GUI_SELFTEST").as_deref() == Ok("terminate") {
+            match self.step {
+                0 if t > 2.0 => {
+                    push(Cmd::ToggleRecording);
+                    self.step = 1;
+                }
+                1 if t > 5.0 => {
+                    println!("selftest: recording={} -> NSApp terminate:", app.st.recording.is_some());
+                    let mtm = objc2::MainThreadMarker::new().unwrap();
+                    objc2_app_kit::NSApplication::sharedApplication(mtm).terminate(None);
+                    self.step = 2;
+                }
+                _ => {}
+            }
+            return;
+        }
         match self.step {
             0 if t > 3.0 => {
                 println!("selftest: idle preview session={} frame_shown={}", app.st.preview.is_some(), app.st.frames_shown > 0);
@@ -819,10 +847,12 @@ pub fn run(start_recording: bool, settings: bool) -> Result<()> {
     }
     record::install_pause_signals();
     let el = EventLoop::<()>::with_user_event()
-        .with_activation_policy(ActivationPolicy::Accessory)
+        // A regular app: Dock icon (support/AppIcon.icns) and a menu bar.
+        .with_activation_policy(ActivationPolicy::Regular)
         .with_default_menu(false)
         .build()?;
     let _ = PROXY.set(Mutex::new(el.create_proxy()));
+    dock::install();
     let mut app = App::new(start_recording);
     if settings {
         push(Cmd::ShowSettings);

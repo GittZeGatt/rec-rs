@@ -81,3 +81,14 @@ pub fn open_folder(dir: &std::path::Path) {
     let url = objc2_foundation::NSURL::fileURLWithPath(&crate::util::ns(&dir.to_string_lossy()));
     objc2_app_kit::NSWorkspace::sharedWorkspace().openURL(&url);
 }
+
+/// Dock icon for the running app (the bundle's AppIcon.icns covers Finder;
+/// this also covers `rec-rs gui` outside the bundle and a stale Dock cache).
+pub fn set_dock_icon() {
+    static ICON: &[u8] = include_bytes!("../../support/icon.png");
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    let data = objc2_foundation::NSData::with_bytes(ICON);
+    if let Some(img) = { use objc2::AnyThread; objc2_app_kit::NSImage::initWithData(objc2_app_kit::NSImage::alloc(), &data) } {
+        unsafe { objc2_app_kit::NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&img)) };
+    }
+}

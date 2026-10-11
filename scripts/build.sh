@@ -12,8 +12,9 @@ STAGE=dist/.Rec.app.new
 # Build the bundle beside the old one and swap it in atomically: overwriting a
 # running binary in place makes macOS kill an in-progress recording.
 rm -rf "$STAGE"
-mkdir -p "$STAGE/Contents/MacOS"
+mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp support/Info.plist "$STAGE/Contents/Info.plist"
+cp support/AppIcon.icns "$STAGE/Contents/Resources/AppIcon.icns"
 cp "$CARGO_TARGET_DIR/$PROFILE/rec-rs" "$STAGE/Contents/MacOS/rec-rs"
 IDENTITY="${REC_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development|Developer ID Application/ {print $2; exit}')}"
 if [ -z "$IDENTITY" ]; then
@@ -22,7 +23,8 @@ if [ -z "$IDENTITY" ]; then
 fi
 codesign --force --sign "$IDENTITY" --identifier com.heyfabrika.rec "$STAGE"
 codesign --verify --strict "$STAGE"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$STAGE/Contents/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns.new" && mv -f "$APP/Contents/Resources/AppIcon.icns.new" "$APP/Contents/Resources/AppIcon.icns"
 cp "$STAGE/Contents/Info.plist" "$APP/Contents/Info.plist.new" && mv -f "$APP/Contents/Info.plist.new" "$APP/Contents/Info.plist"
 mv -f "$STAGE/Contents/MacOS/rec-rs" "$APP/Contents/MacOS/rec-rs"
 rm -f "$APP/Contents/MacOS/rec"  # pre-rename executable
@@ -30,6 +32,10 @@ rm -rf "$APP/Contents/_CodeSignature"
 mv "$STAGE/Contents/_CodeSignature" "$APP/Contents/_CodeSignature"
 rm -rf "$STAGE"
 codesign --verify --strict "$APP"
+# Re-register the bundle so Finder and the Dock pick up icon/Info.plist
+# changes (LaunchServices caches them per bundle path).
+touch "$APP"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" || true
 ln -sf "Rec.app/Contents/MacOS/rec-rs" dist/rec-rs
 ln -sf rec-rs dist/rec  # short alias
 echo "built $APP (signed: $IDENTITY)"
