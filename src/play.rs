@@ -14,18 +14,20 @@ use objc2_foundation::{NSDate, NSRunLoop, NSURL};
 
 use crate::util::ns;
 
-pub fn play(path: &Path, secs: f64) -> Result<()> {
+pub fn play(path: &Path, secs: f64, size: &str) -> Result<()> {
+    let (w, h) = size.split_once('x').context("--size must be WxH")?;
+    let (w, h): (f64, f64) = (w.parse()?, h.parse()?);
     let mtm = MainThreadMarker::new().context("must run on the main thread")?;
     let abs = std::path::absolute(path)?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     app.finishLaunching();
-    let rect = CGRect::new(CGPoint::new(200.0, 200.0), CGSize::new(640.0, 360.0));
+    let rect = CGRect::new(CGPoint::new(200.0, 200.0), CGSize::new(w, h));
     let win = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
             rect,
-            NSWindowStyleMask::Titled,
+            NSWindowStyleMask::Borderless,
             NSBackingStoreType::Buffered,
             false,
         )

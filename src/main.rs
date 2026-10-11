@@ -45,6 +45,9 @@ enum Cmd {
         /// Open the settings window at launch.
         #[arg(long)]
         settings: bool,
+        /// Capture this window (ID from `rec-rs devices`) instead of the display.
+        #[arg(long, value_name = "ID")]
+        window: Option<u32>,
     },
     /// List displays, windows, cameras and microphones.
     Devices,
@@ -71,6 +74,9 @@ enum Cmd {
         file: PathBuf,
         #[arg(long, default_value_t = 15.0)]
         secs: f64,
+        /// Window content size in points, WIDTHxHEIGHT.
+        #[arg(long, default_value = "640x360")]
+        size: String,
     },
 }
 
@@ -447,8 +453,8 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     tcc::disclaim_and_reexec();
     let cli = Cli::parse();
-    let r = match cli.cmd.unwrap_or(Cmd::Gui { start_recording: false, settings: false }) {
-        Cmd::Gui { start_recording, settings } => app::run(start_recording, settings),
+    let r = match cli.cmd.unwrap_or(Cmd::Gui { start_recording: false, settings: false, window: None }) {
+        Cmd::Gui { start_recording, settings, window } => app::run(start_recording, settings, window),
         Cmd::Record(a) => record(a),
         Cmd::Devices => {
             let r = devices();
@@ -471,7 +477,7 @@ fn main() {
             Ok(())
         }
         Cmd::Probe { file } => probe::probe(&file),
-        Cmd::Play { file, secs } => play::play(&file, secs),
+        Cmd::Play { file, secs, size } => play::play(&file, secs, &size),
     };
     if let Err(e) = r {
         eprintln!("rec: error: {e:#}");

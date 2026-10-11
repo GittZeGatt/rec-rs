@@ -111,6 +111,15 @@ impl MenuBar {
         mb
     }
 
+    /// Open the status item's menu (REC_SHOW_MENU, for screenshots).
+    pub fn pop_up(&self) {
+        if let Some(mtm) = MainThreadMarker::new()
+            && let Some(b) = self.status.button(mtm)
+        {
+            unsafe { b.performClick(None) };
+        }
+    }
+
     pub fn hotkey_unavailable(&self) {
         self.hotkey.setTitle(&ns("Global hotkey ⇧⌘R unavailable"));
     }

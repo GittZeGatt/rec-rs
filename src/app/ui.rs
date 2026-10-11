@@ -21,6 +21,14 @@ pub fn take_drag_request() -> bool {
     DRAG.swap(false, Ordering::Relaxed)
 }
 
+/// A path with the home folder shown as `~`.
+fn tilde(p: &std::path::Path) -> String {
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(h) if p.starts_with(&h) => format!("~/{}", p.strip_prefix(&h).unwrap().display()),
+        _ => p.display().to_string(),
+    }
+}
+
 fn section(ui: &mut Ui, title: &str) {
     ui.add_space(10.0);
     ui.label(RichText::new(title).font(theme::semibold(SECONDARY)).color(theme::pal(ui).secondary));
@@ -485,7 +493,7 @@ fn sources(ui: &mut Ui, st: &mut State) {
             .size(SECONDARY)
             .color(theme::pal(ui).secondary),
     );
-    ui.label(RichText::new(s.output_dir.display().to_string()).size(SECONDARY).color(theme::pal(ui).secondary));
+    ui.label(RichText::new(tilde(&s.output_dir)).size(SECONDARY).color(theme::pal(ui).secondary));
 
     if s != st.settings {
         st.settings = s;
@@ -535,7 +543,7 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
     grid(ui, "out", &mut |ui| {
         ui.label("Folder");
         ui.horizontal(|ui| {
-            ui.label(RichText::new(s.output_dir.display().to_string()).size(SECONDARY));
+            ui.label(RichText::new(tilde(&s.output_dir)).size(SECONDARY));
             if ui.button("Choose…").clicked()
                 && let Some(d) = rfd::FileDialog::new().set_directory(&s.output_dir).pick_folder()
             {

@@ -42,6 +42,12 @@ pub enum Cmd {
 static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
 static PROXY: OnceLock<Mutex<EventLoopProxy<()>>> = OnceLock::new();
 
+/// REC_GUI_BACKGROUND: open windows without taking focus from the app in
+/// use (scripted runs and screenshots while someone works).
+fn background() -> bool {
+    std::env::var_os("REC_GUI_BACKGROUND").is_some()
+}
+
 /// Wake the event loop (from any thread).
 fn wake() {
     if let Some(p) = PROXY.get() {
@@ -188,6 +194,8 @@ struct App {
     last_tick: Instant,
     last_meter: Instant,
     start_recording: bool,
+    launched: Instant,
+    menu_shown: bool,
     selftest: Option<SelfTest>,
     finished: Arc<Mutex<Option<Finished>>>,
 }
@@ -251,6 +259,8 @@ impl App {
             last_tick: Instant::now(),
             last_meter: Instant::now(),
             start_recording,
+            launched: Instant::now(),
+            menu_shown: false,
             selftest: std::env::var_os("REC_GUI_SELFTEST").map(|_| SelfTest::default()),
             finished: Arc::new(Mutex::new(None)),
         }
@@ -347,12 +357,16 @@ impl App {
         }
         if let Some(w) = &self.main {
             w.window.set_visible(true);
-            w.window.focus_window();
+            if !background() {
+                w.window.focus_window();
+            }
             w.window.request_redraw();
         }
         self.main_visible = true;
         preview::set_wanted(true);
-        macos::activate();
+        if !background() {
+            macos::activate();
+        }
         self.sync_preview();
     }
 
@@ -367,14 +381,18 @@ impl App {
 
     fn show_settings(&mut self, el: &ActiveEventLoop) {
         if self.settings_win.is_none() {
-            let w = self.open_window(el, "Rec Settings", (520.0, 640.0), (460.0, 480.0));
+            let w = self.open_window(el, "Rec Settings", (520.0, 820.0), (460.0, 480.0));
             self.settings_win = Some(w);
         }
         if let Some(w) = &self.settings_win {
-            w.window.focus_window();
+            if !background() {
+                w.window.focus_window();
+            }
             w.window.request_redraw();
         }
-        macos::activate();
+        if !background() {
+            macos::activate();
+        }
     }
 
     fn options(&self, output: Option<&std::path::Path>) -> Result<(record::Options, Option<crate::screen::Target>)> {
@@ -515,6 +533,14 @@ impl App {
     /// Periodic work: commands, signals, finished recordings, failures,
     /// menu bar, meters.
     fn tick(&mut self, el: &ActiveEventLoop) {
+        // REC_SHOW_MENU: open the menu bar menu once, 3 s after launch
+        // (for screenshots). It tracks modally until dismissed.
+        if !self.menu_shown && std::env::var_os("REC_SHOW_MENU").is_some() && self.launched.elapsed() > Duration::from_secs(3) {
+            self.menu_shown = true;
+            if let Some(m) = &self.menubar {
+                m.pop_up();
+            }
+        }
         if let Some(mut t) = self.selftest.take() {
             t.step(self);
             self.selftest = Some(t);
@@ -880,7 +906,7 @@ impl SelfTest {
     }
 }
 
-pub fn run(start_recording: bool, settings: bool) -> Result<()> {
+pub fn run(start_recording: bool, settings: bool, window: Option<u32>) -> Result<()> {
     use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
     unsafe {
         libc::signal(libc::SIGINT, on_sigint as *const () as usize);
@@ -896,6 +922,7 @@ pub fn run(start_recording: bool, settings: bool) -> Result<()> {
     let _ = PROXY.set(Mutex::new(el.create_proxy()));
     dock::install();
     let mut app = App::new(start_recording);
+    app.st.settings.window = window;
     if settings {
         push(Cmd::ShowSettings);
     }
