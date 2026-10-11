@@ -323,6 +323,11 @@ fn record(a: RecordArgs) -> Result<()> {
     if std::env::var_os("REC_DEBUG").is_some() {
         let avg = |sum: f64, n: u64| if n == 0 { 0.0 } else { sum / n as f64 * 1000.0 };
         eprintln!(
+            "rec: debug: encoder busy retries {}, audio gaps filled {}",
+            stats.video_retries,
+            stats.audio_gaps_filled
+        );
+        eprintln!(
             "rec: debug: frame arrival latency  screen avg {:.1} ms max {:.1} ms ({} frames)  camera avg {:.1} ms max {:.1} ms ({} frames)",
             avg(stats.screen_latency_sum, stats.screen_frames_in),
             stats.screen_latency_max * 1000.0,

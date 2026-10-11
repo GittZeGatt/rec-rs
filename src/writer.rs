@@ -81,6 +81,10 @@ pub struct Stats {
     pub audio_drops: u64,
     pub audio_mix_buffers: u64,
     pub audio_clipped_samples: u64,
+    /// Audio gaps (late start, dropped device buffers) filled with silence.
+    pub audio_gaps_filled: u64,
+    /// Pacer passes that waited for a busy encoder.
+    pub video_retries: u64,
     /// Grid slots skipped while paused.
     pub paused_slots: u64,
     /// Arrival latency (host now - capture pts), max and sum, in seconds.
@@ -210,6 +214,10 @@ pub struct Sink {
     scene: Scene,
     /// Stop writing after this many output slots (exact `--duration`).
     limit: Option<i64>,
+    /// Output-timeline position (seconds) where each audio stem continues.
+    audio_next: [Option<f64>; 2],
+    /// Audio that arrived before the first video frame set the clock.
+    preroll: VecDeque<(AudioKind, SendBox<CFRetained<CMSampleBuffer>>)>,
     screen_q: VecDeque<(f64, Pb)>,
     screen_last: Option<Pb>,
     cam_q: VecDeque<(f64, Pb)>,
@@ -225,6 +233,14 @@ unsafe impl Send for Sink {}
 /// Minimum distance behind real time that emission runs, so late-arriving
 /// frames still land in their own slot.
 pub const LAG_SECS: f64 = 0.05;
+
+/// How far behind its time a frame slot may fall while the encoder is busy
+/// before it is dropped. Below this the slot is retried on the next pacer
+/// pass (with its own timestamp), so brief encoder stalls cost no frames.
+pub const MAX_BACKLOG_SECS: f64 = 0.5;
+
+/// Audio timestamp jitter tolerated before a stem is padded or trimmed.
+pub const SNAP_SECS: f64 = 0.0015;
 
 fn video_settings(v: &VideoSpec) -> Retained<Dict> {
     unsafe {
@@ -311,6 +327,8 @@ impl Sink {
             pauses: Pauses::default(),
             scene: if compositor.is_some() { scene } else { Scene::Screen },
             limit: None,
+            audio_next: [None; 2],
+            preroll: VecDeque::new(),
             screen_q: VecDeque::new(),
             screen_last: None,
             cam_q: VecDeque::new(),
@@ -417,6 +435,9 @@ impl Sink {
                 }
             }
         }
+        for (kind, sb) in std::mem::take(&mut self.preroll) {
+            self.push_audio(kind, &sb.0);
+        }
         self.screen_q.push_back((pts_s, SendBox(pb)));
         // Never hold more than a few ScreenCaptureKit surfaces (its pool is small).
         while self.screen_q.len() > 4 {
@@ -436,12 +457,17 @@ impl Sink {
     }
 
     pub fn push_audio(&mut self, kind: AudioKind, sb: &CMSampleBuffer) {
-        let Some(t0) = self.t0 else { return };
+        let Some(t0) = self.t0 else {
+            // Keep it until the clock starts; the part after t0 is used.
+            let sb = unsafe { CFRetained::retain(std::ptr::NonNull::from(sb)) };
+            self.preroll.push_back((kind, SendBox(sb)));
+            if self.preroll.len() > 400 {
+                self.preroll.pop_front();
+            }
+            return;
+        };
         let pts = unsafe { sb.presentation_time_stamp() };
         let pts_s = secs(pts);
-        if pts_s * (TIMESCALE as f64) < t0 as f64 {
-            return;
-        }
         let i = (kind == AudioKind::Mic) as usize;
         let decoded = crate::mixer::decode(sb);
         if let Some((_, _, frames)) = &decoded {
@@ -456,6 +482,11 @@ impl Sink {
         let to_slot = |t: f64| (t * TIMESCALE as f64 - t0 as f64) / self.tps() as f64;
         let (a, b) = (to_slot(pts_s), to_slot(pts_s + n as f64 / rate));
         let Some((x, y, off)) = self.pauses.keep(a, b) else { return };
+        // Nothing before the session start (slot 0).
+        let x = x.max(0.0);
+        if y <= x {
+            return;
+        }
         let slot_secs = 1.0 / self.fps as f64;
         let mut i0 = (((x - a) * slot_secs * rate).round() as usize).min(n);
         let mut i1 = (((y - a) * slot_secs * rate).round() as usize).min(n);
@@ -477,30 +508,55 @@ impl Sink {
             AudioKind::Mic => o.mic.as_ref(),
         };
         let Some(input) = input else { return };
-        let retimed;
-        let buf: &CMSampleBuffer = if shift == 0 && (i0, i1) == (0, n) {
-            sb
-        } else {
-            match retime(sb, i0, i1, shift) {
-                Some(b) => {
-                    retimed = b;
-                    &retimed
-                }
+        let input = input.clone();
+        // AVAssetWriter lays audio buffers end to end whatever their
+        // timestamps say, so keep the track on the capture clock here: fill
+        // a gap (late start, dropped device buffer) with silence and trim
+        // an overlap, both sample-accurate. Error stays under SNAP_SECS.
+        let start = self.audio_next[i].unwrap_or(t0 as f64 / TIMESCALE as f64);
+        let gap = out_s - start;
+        let (mut i0, mut pad) = (i0, 0usize);
+        if gap > SNAP_SECS {
+            pad = (gap * rate).round() as usize;
+        } else if gap < -SNAP_SECS {
+            i0 += (-gap * rate).round() as usize;
+            if i0 >= i1 {
+                return;
+            }
+        }
+        let at = |t: f64| unsafe { CMTime::new((t * TIMESCALE as f64).round() as i64, TIMESCALE) };
+        let mut bufs = vec![];
+        if pad > 0 {
+            match silence_like(sb, pad, at(start)) {
+                Some(b) => bufs.push(b),
                 None => {
                     self.stats.audio_drops += 1;
                     return;
                 }
             }
-        };
-        unsafe {
-            if input.isReadyForMoreMediaData() && input.appendSampleBuffer(buf) {
-                match kind {
-                    AudioKind::System => self.stats.audio_sys_buffers += 1,
-                    AudioKind::Mic => self.stats.audio_mic_buffers += 1,
-                }
-            } else {
+            self.stats.audio_gaps_filled += 1;
+        }
+        // The writer packs this buffer at `start`, whatever its timestamp.
+        let body_start = start + pad as f64 / rate;
+        match retime(sb, i0, i1, ((pts_s + i0 as f64 / rate - body_start) * TIMESCALE as f64).round() as i64) {
+            Some(b) => bufs.push(b),
+            None => {
                 self.stats.audio_drops += 1;
-                self.check_writer();
+                return;
+            }
+        }
+        self.audio_next[i] = Some(body_start + (i1 - i0) as f64 / rate);
+        for b in bufs {
+            unsafe {
+                if input.isReadyForMoreMediaData() && input.appendSampleBuffer(&b) {
+                    match kind {
+                        AudioKind::System => self.stats.audio_sys_buffers += 1,
+                        AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+                    }
+                } else {
+                    self.stats.audio_drops += 1;
+                    self.check_writer();
+                }
             }
         }
     }
@@ -562,6 +618,16 @@ impl Sink {
             let slot = self.next_slot;
             let slot_t = self.slot_ticks(slot) as f64 / TIMESCALE as f64;
             if slot_t > until {
+                break;
+            }
+            // Encoder busy (e.g. a GPU load spike): retry this slot later
+            // unless it is already too far behind.
+            if self.pauses.offset_at(slot as f64).is_some()
+                && let Some(o) = &self.out
+                && !unsafe { o.video.isReadyForMoreMediaData() }
+                && slot_t > until - MAX_BACKLOG_SECS
+            {
+                self.stats.video_retries += 1;
                 break;
             }
             let before = self.screen_q.len();
@@ -755,6 +821,53 @@ fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout
             bail!("startWriting failed: {}", err_text(&writer));
         }
         Ok(Out { writer, video, adaptor, sys, mic, mix_input })
+    }
+}
+
+/// `frames` of silence in the same format as `like`, starting at `pts`.
+fn silence_like(like: &CMSampleBuffer, frames: usize, pts: CMTime) -> Option<CFRetained<CMSampleBuffer>> {
+    use objc2_core_media::*;
+    unsafe {
+        let fmt = like.format_description()?;
+        let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(&fmt).as_ref()?;
+        let non_inter = asbd.mFormatFlags & objc2_core_audio_types::kAudioFormatFlagIsNonInterleaved != 0;
+        let per_frame = asbd.mBytesPerFrame as usize * if non_inter { asbd.mChannelsPerFrame as usize } else { 1 };
+        let bytes = frames * per_frame;
+        if bytes == 0 {
+            return None;
+        }
+        let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
+        if CMBlockBuffer::create_with_memory_block(
+            None,
+            std::ptr::null_mut(),
+            bytes,
+            None,
+            std::ptr::null(),
+            0,
+            bytes,
+            kCMBlockBufferAssureMemoryNowFlag,
+            std::ptr::NonNull::from(&mut block),
+        ) != 0
+        {
+            return None;
+        }
+        let block = CFRetained::from_raw(std::ptr::NonNull::new(block)?);
+        CMBlockBuffer::fill_data_bytes(0, &block, 0, bytes);
+        let mut out: *mut CMSampleBuffer = std::ptr::null_mut();
+        let fd: &CMAudioFormatDescription = &*(&*fmt as *const CMFormatDescription as *const CMAudioFormatDescription);
+        if CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            None,
+            &block,
+            fd,
+            frames as isize,
+            pts,
+            std::ptr::null(),
+            std::ptr::NonNull::from(&mut out),
+        ) != 0
+        {
+            return None;
+        }
+        std::ptr::NonNull::new(out).map(|b| CFRetained::from_raw(b))
     }
 }
 

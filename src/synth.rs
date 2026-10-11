@@ -130,6 +130,8 @@ impl Synth {
                 let rate = crate::mixer::RATE;
                 let chunk = 480usize; // 10 ms
                 let mut k = 0i64;
+                // Self-test hook: drop every Nth buffer like a glitching device.
+                let drop_every: i64 = std::env::var("REC_SYNTH_DROP_AUDIO").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
                 while !stop3.load(Ordering::SeqCst) {
                     let t = start + (k * chunk as i64) as f64 / rate;
                     let now = secs(host_now());
@@ -140,7 +142,9 @@ impl Synth {
                     }
                     objc2::rc::autoreleasepool(|_| {
                         let pts = unsafe { objc2_core_media::CMTime::new(start as i64 * rate as i64 + k * chunk as i64, rate as i32) };
-                        if let Some(sb) = crate::mixer::pcm_buffer(&fmt, beep_samples(k * chunk as i64, chunk), pts) {
+                        let dropped = drop_every > 0 && k % drop_every == drop_every - 1;
+                        if dropped {
+                        } else if let Some(sb) = crate::mixer::pcm_buffer(&fmt, beep_samples(k * chunk as i64, chunk), pts) {
                             shared3.with(|s| s.push_audio(crate::writer::AudioKind::System, &sb));
                         }
                     });
