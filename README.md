@@ -43,7 +43,33 @@ macOS may also ask you to confirm that Rec can "bypass the system private window
 
 `dist/rec permissions` shows the current status.
 
-## Record
+## Menu bar app
+
+```sh
+open dist/Rec.app          # or: dist/rec gui   (or just: dist/rec)
+```
+
+A record icon appears in the menu bar. Press **⇧⌘R** anywhere to start or stop recording; the
+icon turns red and shows the elapsed time. The menu has:
+
+- **Start/Stop Recording** (⇧⌘R).
+- **Show Preview**: a floating 16:9 window with the live output, including the webcam overlay.
+  It works before recording, so you can frame the shot. Rec's own windows are excluded from the
+  capture, so the preview never records itself.
+- **Resolution** (1080p, 1440p, 4K, Native), **Webcam Overlay**, **Microphone** and **System
+  Audio** toggles. Settings persist between launches.
+- **Reveal Last Recording** and **Open Recordings Folder** (`~/Movies`).
+
+Recordings use the same pipeline and output format as the CLI. `rec stop` also stops a
+recording started from the menu bar, and the app finalizes the file if it is quit or sent
+SIGTERM mid-recording. `rec gui --start-recording` starts recording at launch, which suits a
+Login Item.
+
+⇧⌘R is registered system-wide while Rec runs. Other apps that use ⇧⌘R, such as a browser's
+hard reload, won't see it until Rec quits. If another app already owns the combo, the menu says
+the hotkey is unavailable.
+
+## Record from the command line
 
 ```sh
 # 1080p60 screen + system audio + default mic (Ctrl-C to stop)
@@ -87,6 +113,8 @@ Run `scripts/selftest.sh` to record and verify a clip through every pipeline. Ad
 `--no-screen` to skip the cases that need screen access.
 
 Other commands:
+
+- `rec gui` (or `rec` with no arguments) starts the menu bar app.
 
 - `rec devices` lists displays, windows, cameras and microphones.
 - `rec probe FILE` checks a recording with AVFoundation, QuickTime's own engine. It reports
@@ -141,15 +169,17 @@ editors still see every track.
 | Pause / resume | ✅ | ❌ |
 | Replay buffer | ✅ | ❌ |
 | Streaming (RTMP, WHIP) | ✅ | ❌ |
-| GUI, preview, hotkeys | ✅ | ❌ CLI only. `rec stop` can be bound to a hotkey. |
+| GUI | ✅ full window | ✅ menu bar app (settings menu); no scene editor |
+| Live preview | ✅ | ✅ floating preview window |
+| Global start/stop hotkey | ✅ configurable | ✅ ⇧⌘R (fixed) |
 | Live audio meters | ✅ | ✅ peak dBFS in the status line |
 | Footprint | about 300 MB app | a few MB binary, about 30% of one core at 4K60 with webcam |
 | Permissions attributed to the recorder itself | ✅ app bundle | ✅ disclaimed re-launch of signed `Rec.app` |
 
 ## Known gaps
 
-- There is no GUI or live preview. It is a CLI, so global hotkeys need an external tool such as
-  Shortcuts, Raycast or skhd running `rec stop`.
+- The GUI is a menu bar app, not a full window. Window and region capture, codec, bitrate and
+  pip layout are CLI-only. The hotkey is fixed to ⇧⌘R.
 - There are no scenes, no multi-display capture and no capture of every window of an app.
 - There is no pause/resume, replay buffer or streaming.
 - There are no audio filters. The mic is recorded as the device delivers it.
@@ -168,6 +198,8 @@ editors still see every track.
 | Path | Contents |
 |---|---|
 | `src/main.rs` | CLI |
+| `src/gui.rs` | Menu bar app, preview window |
+| `src/hotkey.rs` | Global hotkey (Carbon `RegisterEventHotKey`, no Accessibility permission) |
 | `src/record.rs` | Session orchestration, pacing thread, signals, `rec stop` |
 | `src/screen.rs` | ScreenCaptureKit stream, displays and windows |
 | `src/camera.rs` | Webcam and AVCapture mic, device enumeration |

@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Status (2026-10-11 ~00:10 EDT): CLI recorder working end to end; GUI milestone in progress
+## Status (2026-10-11 ~01:10 EDT): CLI and menu bar app working end to end
 
 `rec` records a 1080p60 or 4K60 screen, system audio, mic and webcam overlay into one `.mov`.
 AVFoundation (QuickTime's engine) reports every file playable and decodes every frame and audio
@@ -31,7 +31,7 @@ Milestone 6 is as you described it on 2026-10-11.
 | 3 (inferred) | System audio and mic, mix track plus stems, in sync | **Done**, verified by tooling; no human clap test yet |
 | 4 (inferred) | Webcam overlay | **Done**, verified |
 | 5 (inferred) | Plays in QuickTime and imports into an editor; README with OBS table and gaps | **Partly done**. AVFoundation and ffmpeg verified. Not yet opened in QuickTime's window or imported into Resolve by a person. |
-| 6 | GUI with preview, menu bar icon, Cmd+Shift+R hotkey | **Not done** as of the first report. In progress now, see below. |
+| 6 | GUI with preview, menu bar icon, Cmd+Shift+R hotkey | **Done, one item unverified.** Menu bar icon, live preview and Start/Stop all work in automated GUI tests. ⇧⌘R registers without error and calls the same toggle the tests exercise, but **no physical ⇧⌘R keypress has been tested**. See "Your manual check". |
 
 ## Permissions: all granted
 
@@ -50,7 +50,14 @@ screen recording was switched on in System Settings at about 23:42.
   Development identity. They survived several rebuilds. Signing with a different identity would
   reset them.
 
-## Your manual check (2 minutes)
+## Your manual check (3 minutes)
+
+0. Run `open dist/Rec.app`. A record icon appears in the menu bar. Press **⇧⌘R**: the icon
+   should turn red with a timer. Press **⇧⌘R** again to stop, then use **Reveal Last
+   Recording**. Also try **Show Preview** before recording.
+   - If you see a prompt asking whether a terminal process may **control "System Events"**, click
+     **Don't Allow**. I triggered it by accident while trying to simulate the keypress; Rec does
+     not need it.
 
 1. Open `analysis/raw/sample-4k60.mov`, or a fresh recording, in **QuickTime Player**. The
    video, webcam corner and both voice and system sound should play together.
@@ -77,17 +84,20 @@ screen recording was switched on in System Settings at about 23:42.
 | Crash safety | After SIGKILL at 13 s, the first 10 s were playable. The fragment interval is now 5 s. |
 | Stop paths | Ctrl-C/SIGINT, SIGTERM to the wrapper process, `rec stop` and `-t` all produce finalized files. |
 | Window capture, region capture, ProRes 422, MP4 output | Each works and probes clean. |
-| `scripts/selftest.sh` | 7/7 pass. It covers the test pattern, webcam plus mic, real screen, 4K and MP4. |
+| `scripts/selftest.sh` | 8/8 pass. It covers the test pattern, webcam plus mic, real screen, 4K, MP4 and a scripted menu bar session. |
+| Menu bar app, scripted (`REC_GUI_SELFTEST=1`) | Preview shows frames when idle and while recording. Status shows a running timer. File saved and probed. Preview restarts after the stop and stops when its window closes. Passes both from `dist/rec gui` and from `open dist/Rec.app`. |
+| Menu bar app, external control | `rec stop` finalizes a menu-bar recording and leaves the app running. SIGTERM mid-recording quits after finalizing; the file layout is a normal `ftyp wide mdat moov`. |
+| Preview exclusion | Rec's own app is found and excluded from display capture. A visual check was impossible: the Mac was locked during testing, and macOS's own `screencapture` also showed only wallpaper. |
 
 ## Not done / known gaps
 
 These are tracked in the README under "Known gaps".
 
-- There is no GUI, live preview, pause/resume, scenes, audio filters or streaming.
+- The GUI is a menu bar app, not a full window. There is no pause/resume, scenes, audio filters
+  or streaming.
 - The webcam is burned into the video. There is no separate webcam track.
 - Capture is 8-bit SDR only.
-- The work is not committed to git. Nothing has been committed. Run `git add -A && git commit`
-  when you are happy with it.
+- Work is committed on `master` in Conventional Commits.
 
 ## Log
 
@@ -99,3 +109,9 @@ These are tracked in the README under "Known gaps".
 - 23:45–00:10: Real-time mixer with mix and stem tracks, window and region capture, `rec stop`,
   level meters, ProRes, atomic rebuilds, adaptive emission lag for webcam sync, self-test
   script, soak test, docs.
+- 2026-10-11 00:30–01:10: Committed the existing work. Refactored sessions to be non-blocking,
+  with optional file output and a preview callback. Added the menu bar app, preview window, ⇧⌘R
+  hotkey through Carbon, persisted settings, and `rec gui --start-recording`. `rec stop` and
+  SIGTERM now work with the GUI. Display capture excludes Rec's own windows. Fixed the TCC
+  disclaim check to use the real responsible PID: backgrounded CLI launches were being
+  attributed to the terminal.
