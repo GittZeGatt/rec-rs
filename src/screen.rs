@@ -230,7 +230,28 @@ impl ScreenCapture {
                     if let Some(r) = region {
                         conf.setSourceRect(*r);
                     }
-                    SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &d.display, &NSArray::new())
+                    // Exclude rec's own windows (the GUI preview), which
+                    // would otherwise be recorded as a hall of mirrors.
+                    let me = std::process::id() as i32;
+                    let own = shareable_content()
+                        .ok()
+                        .and_then(|c| c.applications().iter().find(|a| a.processID() == me));
+                    if std::env::var_os("REC_DEBUG").is_some() {
+                        eprintln!("rec: debug: excluding own app from capture: {}", own.is_some());
+                    }
+                    match own {
+                        Some(app) => SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                            SCContentFilter::alloc(),
+                            &d.display,
+                            &NSArray::from_retained_slice(&[app]),
+                            &NSArray::new(),
+                        ),
+                        None => SCContentFilter::initWithDisplay_excludingWindows(
+                            SCContentFilter::alloc(),
+                            &d.display,
+                            &NSArray::new(),
+                        ),
+                    }
                 }
                 Target::Window(w) => {
                     SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w.window)
