@@ -316,6 +316,17 @@ impl Session {
         t
     }
 
+    /// Move or restyle the camera overlay live; also applies to the file.
+    pub fn set_pip(&self, pip: PipSpec) {
+        self.shared.with(|s| s.set_pip(pip));
+    }
+
+    pub fn cam_aspect(&self) -> Option<f64> {
+        let mut a = None;
+        self.shared.with(|s| a = s.cam_aspect());
+        a
+    }
+
     pub fn set_scene(&self, scene: Scene) -> bool {
         let mut ok = false;
         self.shared.with(|s| ok = s.set_scene(scene));

@@ -411,6 +411,18 @@ impl Sink {
         self.pauses.is_paused()
     }
 
+    /// Change the camera overlay live (no-op without a webcam).
+    pub fn set_pip(&mut self, pip: crate::compose::PipSpec) {
+        if let Some(c) = self.compositor.as_mut() {
+            c.set_pip(pip);
+        }
+    }
+
+    /// Aspect ratio of the camera, once frames arrive.
+    pub fn cam_aspect(&self) -> Option<f64> {
+        self.compositor.as_ref().map(|c| c.cam_aspect())
+    }
+
     /// Shift [system, mic] audio later by these seconds: the output device's
     /// latency for system audio (captured when mixed, heard later), plus
     /// any user sync offsets.

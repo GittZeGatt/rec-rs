@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::compose::{Corner, Scene, Shape};
+use crate::compose::{PipSpec, Place, Scene, Shape};
 use crate::writer::{AudioLayout, Codec};
 
 pub const RESOLUTIONS: [(&str, &str); 5] =
@@ -39,8 +39,12 @@ pub struct Settings {
     pub system_gain_db: f32,
     pub mic_gain_db: f32,
     pub pip_size: f64,
-    pub pip_corner: Corner,
+    pub pip_place: Place,
     pub pip_shape: Shape,
+    pub pip_roundness: f64,
+    pub pip_border: f64,
+    pub pip_border_color: [u8; 3],
+    pub pip_shadow: bool,
     pub mirror: bool,
     pub cursor: bool,
     pub clicks: bool,
@@ -68,9 +72,13 @@ impl Default for Settings {
             audio_tracks: AudioLayout::Both,
             system_gain_db: 0.0,
             mic_gain_db: 0.0,
-            pip_size: 0.22,
-            pip_corner: Corner::BottomRight,
-            pip_shape: Shape::Rounded,
+            pip_size: PipSpec::default().size,
+            pip_place: PipSpec::default().place,
+            pip_shape: PipSpec::default().shape,
+            pip_roundness: PipSpec::default().roundness,
+            pip_border: 0.0,
+            pip_border_color: [255, 255, 255],
+            pip_shadow: false,
             mirror: true,
             cursor: true,
             clicks: false,
@@ -115,6 +123,37 @@ impl Settings {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(p, serde_json::to_string_pretty(self).unwrap_or_default())
+    }
+
+    /// The camera overlay these settings describe.
+    pub fn pip_spec(&self) -> PipSpec {
+        PipSpec {
+            size: self.pip_size,
+            place: self.pip_place,
+            shape: self.pip_shape,
+            roundness: self.pip_roundness,
+            border: self.pip_border,
+            border_color: self.pip_border_color,
+            shadow: self.pip_shadow,
+            mirror: self.mirror,
+        }
+    }
+
+    /// The settings that need a new capture session when they change. The
+    /// overlay's look and position are applied live instead.
+    pub fn capture_key(&self) -> Settings {
+        let d = Settings::default();
+        Settings {
+            pip_size: d.pip_size,
+            pip_place: d.pip_place,
+            pip_shape: d.pip_shape,
+            pip_roundness: d.pip_roundness,
+            pip_border: d.pip_border,
+            pip_border_color: d.pip_border_color,
+            pip_shadow: d.pip_shadow,
+            mirror: d.mirror,
+            ..self.clone()
+        }
     }
 
     /// A fresh timestamped file in the output folder.
@@ -163,8 +202,18 @@ impl Settings {
         a.extend(["--system-gain".into(), format!("{}", self.system_gain_db)]);
         a.extend(["--mic-gain".into(), format!("{}", self.mic_gain_db)]);
         a.extend(["--pip-size".into(), format!("{}", self.pip_size)]);
-        a.extend(["--pip-corner".into(), value(self.pip_corner)]);
+        match self.pip_place {
+            Place::Corner(c) => a.extend(["--pip-corner".into(), value(c)]),
+            Place::At([x, y]) => a.extend(["--pip-pos".into(), format!("{},{}", x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))]),
+        }
         a.extend(["--pip-shape".into(), value(self.pip_shape)]);
+        a.extend(["--pip-roundness".into(), format!("{}", self.pip_roundness)]);
+        a.extend(["--pip-border".into(), format!("{}", self.pip_border)]);
+        let [r, g, b] = self.pip_border_color;
+        a.extend(["--pip-border-color".into(), format!("{r:02x}{g:02x}{b:02x}")]);
+        if self.pip_shadow {
+            a.push("--pip-shadow".into());
+        }
         if !self.mirror {
             a.push("--no-mirror".into());
         }
@@ -212,6 +261,40 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--webcam", "default"]));
         assert!(args.windows(2).any(|w| w == ["--codec", "prores"]));
         assert!(args.windows(2).any(|w| w == ["--window", "42"]));
+    }
+
+    #[test]
+    fn overlay_settings_round_trip_through_the_cli() {
+        let s = Settings {
+            scene: Scene::ScreenCam,
+            pip_place: Place::At([0.3, 0.6]),
+            pip_shape: Shape::Pill,
+            pip_roundness: 0.7,
+            pip_border: 6.0,
+            pip_border_color: [10, 200, 30],
+            pip_shadow: true,
+            mirror: false,
+            ..Default::default()
+        };
+        let args = s.record_args(None);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let opts = crate::parse_record_args(&refs).unwrap();
+        assert_eq!(opts.pip_pos.as_deref(), Some("0.3,0.6"));
+        assert_eq!(opts.pip_border_color, "0ac81e");
+        assert!(opts.pip_shadow && opts.no_mirror);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""pip_place":{"at":[0.3,0.6]}"#), "{json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pip_spec(), s.pip_spec());
+    }
+
+    #[test]
+    fn overlay_changes_do_not_restart_capture() {
+        let a = Settings::default();
+        let b = Settings { pip_place: Place::At([0.1, 0.1]), pip_shape: Shape::Circle, pip_shadow: true, ..a.clone() };
+        assert_eq!(a.capture_key(), b.capture_key());
+        let c = Settings { fps: 30, ..a.clone() };
+        assert_ne!(a.capture_key(), c.capture_key());
     }
 
     #[test]

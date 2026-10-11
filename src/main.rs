@@ -129,10 +129,27 @@ pub struct RecordArgs {
     /// Webcam overlay width as a fraction of the frame width.
     #[arg(long, default_value_t = 0.22)]
     pip_size: f64,
+    /// Snap the webcam overlay to a corner.
     #[arg(long, value_enum, default_value_t = Corner::BottomRight)]
     pip_corner: Corner,
+    /// Place the overlay's center anywhere: X,Y as fractions of the frame
+    /// from the top-left (e.g. 0.5,0.5). Overrides --pip-corner.
+    #[arg(long, value_name = "X,Y")]
+    pip_pos: Option<String>,
     #[arg(long, value_enum, default_value_t = Shape::Rounded)]
     pip_shape: Shape,
+    /// Corner roundness 0..1 (rounded, square and squircle shapes).
+    #[arg(long, default_value_t = 0.2)]
+    pip_roundness: f64,
+    /// Overlay border width in pixels at 1080p (0 = none).
+    #[arg(long, default_value_t = 0.0)]
+    pip_border: f64,
+    /// Border color as hex RGB.
+    #[arg(long, default_value = "ffffff", value_name = "RRGGBB")]
+    pip_border_color: String,
+    /// Soft drop shadow under the overlay.
+    #[arg(long)]
+    pip_shadow: bool,
     /// Do not mirror the webcam.
     #[arg(long)]
     no_mirror: bool,
@@ -204,6 +221,23 @@ fn parse_size(s: &str, native: (usize, usize), keep_aspect: bool) -> Result<(usi
     Ok((even(native.0 as f64 * s), even(native.1 as f64 * s)))
 }
 
+fn parse_pos(s: &str) -> Result<[f64; 2]> {
+    let v: Vec<f64> = s.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>()?;
+    match v[..] {
+        [x, y] if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) => Ok([x, y]),
+        _ => bail!("--pip-pos must be X,Y with both between 0 and 1"),
+    }
+}
+
+fn parse_hex(s: &str) -> Result<[u8; 3]> {
+    let s = s.trim_start_matches('#');
+    if s.len() != 6 {
+        bail!("color must be RRGGBB hex");
+    }
+    let c = |i: usize| u8::from_str_radix(&s[i..i + 2], 16);
+    Ok([c(0)?, c(2)?, c(4)?])
+}
+
 fn default_output() -> PathBuf {
     let mut buf = [0u8; 64];
     let n = unsafe {
@@ -239,7 +273,19 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         system_audio: !a.no_system_audio,
         mic,
         webcam,
-        pip: PipSpec { size: a.pip_size.clamp(0.05, 0.9), corner: a.pip_corner, shape: a.pip_shape, mirror: !a.no_mirror },
+        pip: PipSpec {
+            size: a.pip_size.clamp(0.05, 0.9),
+            place: match &a.pip_pos {
+                Some(p) => compose::Place::At(parse_pos(p)?),
+                None => compose::Place::Corner(a.pip_corner),
+            },
+            shape: a.pip_shape,
+            roundness: a.pip_roundness.clamp(0.0, 1.0),
+            border: a.pip_border.clamp(0.0, 64.0),
+            border_color: parse_hex(&a.pip_border_color)?,
+            shadow: a.pip_shadow,
+            mirror: !a.no_mirror,
+        },
         cursor: !a.no_cursor,
         clicks: a.clicks,
         duration: a.duration,
@@ -469,6 +515,21 @@ mod tests {
         // keep-aspect shrinks to the display's 1.547 aspect, even sizes.
         assert_eq!(parse_size("1080p", native, true).unwrap(), (1670, 1080));
         assert!(parse_size("huge", native, false).is_err());
+    }
+
+    #[test]
+    fn overlay_options() {
+        let a = parse_record_args(&["--cam", "--pip-pos", "0.25,0.75", "--pip-shape", "squircle", "--pip-roundness", "0.6",
+            "--pip-border", "8", "--pip-border-color", "#ff8800", "--pip-shadow"]).unwrap();
+        assert_eq!(parse_pos(a.pip_pos.as_deref().unwrap()).unwrap(), [0.25, 0.75]);
+        assert_eq!(a.pip_shape, Shape::Squircle);
+        assert_eq!(parse_hex(&a.pip_border_color).unwrap(), [255, 136, 0]);
+        assert!(a.pip_shadow);
+        assert!(parse_pos("1.5,0").is_err());
+        assert!(parse_hex("fff").is_err());
+        for s in ["circle", "rounded", "square", "pill", "squircle", "rect"] {
+            assert!(parse_record_args(&["--pip-shape", s]).is_ok(), "{s}");
+        }
     }
 
     #[test]
