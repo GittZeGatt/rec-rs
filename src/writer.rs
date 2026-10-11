@@ -216,6 +216,8 @@ pub struct Sink {
     limit: Option<i64>,
     /// Output-timeline position (seconds) where each audio stem continues.
     audio_next: [Option<f64>; 2],
+    /// Seconds added to [system, mic] audio timestamps.
+    audio_offset: [f64; 2],
     /// Audio that arrived before the first video frame set the clock.
     preroll: VecDeque<(AudioKind, SendBox<CFRetained<CMSampleBuffer>>)>,
     screen_q: VecDeque<(f64, Pb)>,
@@ -329,6 +331,7 @@ impl Sink {
             limit: None,
             audio_next: [None; 2],
             preroll: VecDeque::new(),
+            audio_offset: [0.0; 2],
             screen_q: VecDeque::new(),
             screen_last: None,
             cam_q: VecDeque::new(),
@@ -408,6 +411,13 @@ impl Sink {
         self.pauses.is_paused()
     }
 
+    /// Shift [system, mic] audio later by these seconds: the output device's
+    /// latency for system audio (captured when mixed, heard later), plus
+    /// any user sync offsets.
+    pub fn set_audio_offsets(&mut self, offsets: [f64; 2]) {
+        self.audio_offset = offsets;
+    }
+
     /// Write at most `secs` of output (rounded to whole frames).
     pub fn limit_secs(&mut self, secs: Option<f64>) {
         self.limit = secs.map(|d| (d * self.fps as f64).round() as i64);
@@ -467,8 +477,10 @@ impl Sink {
             return;
         };
         let pts = unsafe { sb.presentation_time_stamp() };
-        let pts_s = secs(pts);
         let i = (kind == AudioKind::Mic) as usize;
+        // When the sound was heard (see `set_audio_offsets`).
+        let real_s = secs(pts);
+        let pts_s = real_s + self.audio_offset[i];
         let decoded = crate::mixer::decode(sb);
         if let Some((_, _, frames)) = &decoded {
             let peak = frames.iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
@@ -538,7 +550,7 @@ impl Sink {
         }
         // The writer packs this buffer at `start`, whatever its timestamp.
         let body_start = start + pad as f64 / rate;
-        match retime(sb, i0, i1, ((pts_s + i0 as f64 / rate - body_start) * TIMESCALE as f64).round() as i64) {
+        match retime(sb, i0, i1, ((real_s + i0 as f64 / rate - body_start) * TIMESCALE as f64).round() as i64) {
             Some(b) => bufs.push(b),
             None => {
                 self.stats.audio_drops += 1;

@@ -3,6 +3,8 @@ mod camera;
 mod compose;
 mod hotkey;
 mod mixer;
+mod outlatency;
+mod play;
 mod probe;
 mod record;
 mod screen;
@@ -28,6 +30,8 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+// RecordArgs is large but parsed once; boxing it buys nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Record the screen (plus system audio, mic, and optional webcam overlay).
@@ -61,6 +65,13 @@ enum Cmd {
     },
     /// Check a recording with AVFoundation (the engine QuickTime uses).
     Probe { file: PathBuf },
+    /// Play a file in an AVPlayer window (reference player for sync tests).
+    #[command(hide = true)]
+    Play {
+        file: PathBuf,
+        #[arg(long, default_value_t = 15.0)]
+        secs: f64,
+    },
 }
 
 #[derive(Args)]
@@ -140,6 +151,13 @@ pub struct RecordArgs {
     /// Audio tracks when recording both system audio and mic.
     #[arg(long, value_enum, default_value_t = writer::AudioLayout::Both)]
     audio_tracks: writer::AudioLayout,
+    /// Shift system audio later by this many ms. Default: the output
+    /// device's latency (system audio is captured before it is heard).
+    #[arg(long, value_name = "MS", allow_hyphen_values = true)]
+    system_audio_offset_ms: Option<f64>,
+    /// Shift the microphone later by this many ms (e.g. a Bluetooth mic).
+    #[arg(long, value_name = "MS", default_value_t = 0.0, allow_hyphen_values = true)]
+    mic_offset_ms: f64,
     /// System audio gain in the mix track (dB).
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     system_gain: f32,
@@ -231,6 +249,8 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         gains_db: [a.system_gain, a.mic_gain],
         mic_backend: if a.test_pattern { record::MicBackend::Avcapture } else { a.mic_backend },
         scene,
+        system_offset_ms: a.system_audio_offset_ms,
+        mic_offset_ms: a.mic_offset_ms,
     };
     record::check_permissions(&opts)?;
     if !(1..=240).contains(&a.fps) || 60000 % a.fps != 0 {
@@ -384,7 +404,13 @@ fn main() {
     let r = match cli.cmd.unwrap_or(Cmd::Gui { start_recording: false, settings: false }) {
         Cmd::Gui { start_recording, settings } => app::run(start_recording, settings),
         Cmd::Record(a) => record(a),
-        Cmd::Devices => devices(),
+        Cmd::Devices => {
+            let r = devices();
+            if let Some(l) = outlatency::output_latency() {
+                println!("Output latency (system audio is shifted by this): {:.1} ms", l * 1000.0);
+            }
+            r
+        }
         Cmd::Stop => record::stop_running(),
         Cmd::Pause => record::signal_running(true),
         Cmd::Resume => record::signal_running(false),
@@ -399,6 +425,7 @@ fn main() {
             Ok(())
         }
         Cmd::Probe { file } => probe::probe(&file),
+        Cmd::Play { file, secs } => play::play(&file, secs),
     };
     if let Err(e) = r {
         eprintln!("rec: error: {e:#}");

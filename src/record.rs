@@ -89,6 +89,10 @@ pub struct Options {
     pub mic_backend: MicBackend,
     /// Initial scene (only Screen without a webcam).
     pub scene: Scene,
+    /// System audio offset in ms; None = the output device's latency.
+    pub system_offset_ms: Option<f64>,
+    /// Microphone offset in ms.
+    pub mic_offset_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -145,6 +149,17 @@ impl Session {
         let path = write.then_some(o.output.as_path());
         let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, o.scene, preview)?;
         sink.limit_secs(o.duration);
+        // System audio from ScreenCaptureKit is captured when mixed and heard
+        // one output latency later; the synthetic source needs no shift.
+        let sys_ms = match (o.system_offset_ms, o.test_pattern) {
+            (Some(ms), _) => ms,
+            (None, Some(_)) => 0.0,
+            (None, None) => crate::outlatency::output_latency().unwrap_or(0.0) * 1000.0,
+        };
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!("rec: debug: audio offsets: system {sys_ms:+.1} ms, mic {:+.1} ms", o.mic_offset_ms);
+        }
+        sink.set_audio_offsets([sys_ms / 1000.0, o.mic_offset_ms / 1000.0]);
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None), stop: stop.clone() });
         let mut sess = Session {
