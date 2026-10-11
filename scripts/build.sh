@@ -4,6 +4,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 PROFILE="${PROFILE:-release}"
+# The repo is synced between machines (Mutagen): keep build output outside it.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/rec-rs-target}"
 if [ "$PROFILE" = release ]; then cargo build --release; else cargo build; fi
 APP=dist/Rec.app
 STAGE=dist/.Rec.app.new
@@ -12,7 +14,7 @@ STAGE=dist/.Rec.app.new
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS"
 cp support/Info.plist "$STAGE/Contents/Info.plist"
-cp "target/$PROFILE/rec" "$STAGE/Contents/MacOS/rec"
+cp "$CARGO_TARGET_DIR/$PROFILE/rec" "$STAGE/Contents/MacOS/rec"
 IDENTITY="${REC_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development|Developer ID Application/ {print $2; exit}')}"
 if [ -z "$IDENTITY" ]; then
   echo "warning: no signing identity found; ad-hoc signing (permissions reset on every rebuild)" >&2

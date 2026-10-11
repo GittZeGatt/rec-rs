@@ -4,7 +4,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 REC=dist/rec
-OUT=analysis/raw/selftest
+# Test recordings never go inside the (synced) repo.
+OUT="${REC_TEST_DIR:-$HOME/Movies/rec-rs-tests}/selftest"
 rm -rf "$OUT"; mkdir -p "$OUT"
 pass=0; fail=0
 check() {
