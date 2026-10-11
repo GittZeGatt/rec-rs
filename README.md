@@ -24,6 +24,25 @@ The code is a clean-room implementation, licensed MIT OR Apache-2.0. OBS (GPL-2.
 for its architecture only and no OBS code was copied. See
 [analysis/OBS_ARCHITECTURE.md](analysis/OBS_ARCHITECTURE.md).
 
+## Screenshots
+
+![Rec main window: live preview of the recorded screen, scene picker, sources, record button and level meters](docs/screenshots/main.png)
+
+*The main window: a live preview of exactly what gets recorded, the scene picker (Screen,
+Screen + Cam, Camera), sources, record/pause, the timer and level meters.*
+
+| Screen + Cam, squircle with a white border | Screen + Cam, circle moved off the corner |
+|---|---|
+| ![Camera overlay as a squircle with a white border, snapped to the bottom-right corner](docs/screenshots/cam-squircle.png) | ![Camera overlay as a circle with a yellow border, dragged to a custom position](docs/screenshots/cam-circle.png) |
+
+*Drag the camera anywhere in the preview, or snap it to a corner. It can be a circle, rounded
+rectangle, square, pill or squircle, with adjustable roundness, border and shadow. Every change
+is live and baked into the recording. The camera here is a virtual camera with a blank feed.*
+
+| Settings | Menu bar |
+|---|---|
+| ![Settings window: output folder, format, resolution, frame rate, codec, bitrate, audio and camera options](docs/screenshots/settings.png) | ![Menu bar menu: Start Recording (⇧⌘R), Pause, Show Rec Window, Settings, Reveal Last Recording, Open Recordings Folder, Quit](docs/screenshots/menu.png) |
+
 ## Reverse-engineered origin
 
 rec-rs is an independent, clean-room-style reimplementation. It was reverse engineered from
@@ -72,7 +91,7 @@ Recording**. Microphone and camera are approved from the system prompts.
 ## The app
 
 ```sh
-open dist/Rec.app          # or: dist/rec-rs   (or: dist/rec-rs gui [--settings] [--start-recording])
+open dist/Rec.app          # or: dist/rec-rs   (or: dist/rec-rs gui [--settings] [--start-recording] [--window ID])
 ```
 
 The **main window** contains:
