@@ -24,7 +24,7 @@ def flashes(path, fps, start, region):
         x, y, w, h = region
         vf = f"crop=iw*{w}:ih*{h}:iw*{x}:ih*{y}," + vf
     raw = run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-vf", vf,
-               "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+               "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
     n = 64 * 36
     lum = [sum(raw[i:i + n]) / n for i in range(0, len(raw) - n + 1, n)]
     out, prev = [], 0.0
@@ -34,7 +34,7 @@ def flashes(path, fps, start, region):
         prev = l
     return out, len(lum)
 
-def onsets(path, idx, thresh=0.1, quiet=0.2):
+def onsets(path, idx, start=0.0, thresh=0.1, quiet=0.2):
     raw = run(["ffmpeg", "-v", "error", "-i", path, "-map", f"0:a:{idx}", "-ac", "1",
                "-ar", "48000", "-f", "f32le", "-"])
     s = struct.unpack(f"<{len(raw) // 4}f", raw)
@@ -42,7 +42,7 @@ def onsets(path, idx, thresh=0.1, quiet=0.2):
     for i, v in enumerate(s):
         if abs(v) > thresh:
             if (i - last) / 48000 > quiet:
-                out.append(i / 48000)
+                out.append(start + i / 48000)
             last = i
     return out
 
@@ -67,7 +67,7 @@ def main():
     for i, s in enumerate(audio):
         if pick is not None and i not in pick:
             continue
-        on = onsets(a.file, i)
+        on = onsets(a.file, i, float(s.get("start_time", 0)))
         if not on:
             print(f"audio {i}: no beeps (skipped)")
             continue
