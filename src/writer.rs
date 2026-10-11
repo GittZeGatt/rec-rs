@@ -220,6 +220,9 @@ pub struct Sink {
     audio_offset: [f64; 2],
     /// Audio that arrived before the first video frame set the clock.
     preroll: VecDeque<(AudioKind, SendBox<CFRetained<CMSampleBuffer>>)>,
+    /// Decaying peak arrival latency [screen, camera] and when it was set.
+    latency_peak: [f64; 2],
+    latency_at: [f64; 2],
     screen_q: VecDeque<(f64, Pb)>,
     screen_last: Option<Pb>,
     cam_q: VecDeque<(f64, Pb)>,
@@ -235,6 +238,11 @@ unsafe impl Send for Sink {}
 /// Minimum distance behind real time that emission runs, so late-arriving
 /// frames still land in their own slot.
 pub const LAG_SECS: f64 = 0.05;
+
+/// Frames buffered per source before the oldest are dropped.
+/// ScreenCaptureKit's queue depth is 8: hold at most 7, which covers the
+/// emission lag at 60 fps up to about 115 ms of continuous motion.
+const QUEUE_MAX: usize = 7;
 
 /// How far behind its time a frame slot may fall while the encoder is busy
 /// before it is dropped. Below this the slot is retried on the next pacer
@@ -331,6 +339,8 @@ impl Sink {
             limit: None,
             audio_next: [None; 2],
             preroll: VecDeque::new(),
+            latency_peak: [0.0; 2],
+            latency_at: [0.0; 2],
             audio_offset: [0.0; 2],
             screen_q: VecDeque::new(),
             screen_last: None,
@@ -352,8 +362,18 @@ impl Sink {
     /// so wait for the slowest source seen (plus margin) before emitting a
     /// slot, keeping the overlay in sync with audio.
     pub fn lag(&self) -> f64 {
-        let worst = self.stats.screen_latency_max.max(self.stats.cam_latency_max);
+        let worst = self.latency_peak[0].max(self.latency_peak[1]);
         (worst + 0.025).clamp(LAG_SECS, 0.3)
+    }
+
+    /// Track arrival latency as a peak that decays by 50 ms per second, so
+    /// one stall (a busy main thread, a device starting) doesn't keep the
+    /// output delayed for the rest of the session.
+    fn note_latency(&mut self, i: usize, lat: f64, at: f64) {
+        let p = &mut self.latency_peak[i];
+        let decayed = (*p - 0.05 * (at - self.latency_at[i]).max(0.0)).max(0.0);
+        *p = decayed.max(lat);
+        self.latency_at[i] = at;
     }
 
     pub fn started(&self) -> bool {
@@ -445,6 +465,7 @@ impl Sink {
         let pts_s = secs(pts);
         let lat = secs(host_now()) - pts_s;
         self.stats.screen_latency_max = self.stats.screen_latency_max.max(lat);
+        self.note_latency(0, lat, pts_s);
         self.stats.screen_latency_sum += lat;
         if self.t0.is_none() {
             let t0 = (pts_s * TIMESCALE as f64).round() as i64;
@@ -461,21 +482,21 @@ impl Sink {
             self.push_audio(kind, &sb.0);
         }
         self.screen_q.push_back((pts_s, SendBox(pb)));
-        // Never hold more than a few ScreenCaptureKit surfaces (its pool is small).
-        while self.screen_q.len() > 4 {
-            self.screen_last = self.screen_q.pop_front().map(|x| x.1);
-        }
+        // Never hold more than a few ScreenCaptureKit surfaces (its queue
+        // depth is 8).
+        let due = self.due_time();
+        Self::cap(&mut self.screen_q, &mut self.screen_last, QUEUE_MAX, due);
     }
 
     pub fn push_cam(&mut self, pts: CMTime, pb: CFRetained<CVPixelBuffer>) {
         self.stats.cam_frames_in += 1;
         let lat = secs(host_now()) - secs(pts);
         self.stats.cam_latency_max = self.stats.cam_latency_max.max(lat);
+        self.note_latency(1, lat, secs(pts));
         self.stats.cam_latency_sum += lat;
         self.cam_q.push_back((secs(pts), SendBox(pb)));
-        while self.cam_q.len() > 4 {
-            self.cam_last = self.cam_q.pop_front().map(|x| x.1);
-        }
+        let due = self.due_time();
+        Self::cap(&mut self.cam_q, &mut self.cam_last, QUEUE_MAX, due);
     }
 
     pub fn push_audio(&mut self, kind: AudioKind, sb: &CMSampleBuffer) {
@@ -599,6 +620,27 @@ impl Sink {
         }
         self.stats.audio_clipped_samples = m.clipped;
         self.check_writer();
+    }
+
+    /// Latest capture time the next slot to be emitted may show.
+    fn due_time(&self) -> f64 {
+        match self.t0 {
+            Some(_) => self.slot_ticks(self.next_slot) as f64 / TIMESCALE as f64 + 0.5 / self.fps as f64,
+            None => f64::INFINITY,
+        }
+    }
+
+    /// Bound a frame queue. A dropped frame becomes the current one only
+    /// if it is due by the next slot: when emission runs behind, a newer
+    /// frame must not be shown under an earlier timestamp (that put
+    /// content up to several frames early); it is skipped instead.
+    fn cap(q: &mut VecDeque<(f64, Pb)>, last: &mut Option<Pb>, max: usize, due: f64) {
+        while q.len() > max {
+            let (pts, pb) = q.pop_front().unwrap();
+            if pts <= due || last.is_none() {
+                *last = Some(pb);
+            }
+        }
     }
 
     /// Pick the newest queued frame captured at or before `t`.
@@ -999,6 +1041,30 @@ mod tests {
         assert_eq!(p.keep(30.0, 31.0), Some((30.0, 31.0, 10)));
         // A capture spanning a whole pause keeps its longer side.
         assert_eq!(p.keep(9.0, 20.5), Some((9.0, 10.0, 0)));
+    }
+
+    /// Overflowing the frame queue while emission runs behind must never
+    /// make a frame from the future the current one (shown early).
+    #[test]
+    fn queue_cap_never_shows_future_frames() {
+        use super::{Pb, Sink};
+        use objc2_core_foundation::CFRetained;
+        let pool = crate::util::make_pool(16, 16, crate::util::PIX_BGRA);
+        let mut q: std::collections::VecDeque<(f64, Pb)> = Default::default();
+        let mut last: Option<Pb> = None;
+        let mut ids = std::collections::HashMap::new();
+        for i in 0..12 {
+            let mut buf = std::ptr::null_mut();
+            unsafe { objc2_core_video::CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf)) };
+            let pb: CFRetained<objc2_core_video::CVPixelBuffer> = unsafe { CFRetained::from_raw(std::ptr::NonNull::new(buf).unwrap()) };
+            ids.insert(CFRetained::as_ptr(&pb).as_ptr() as usize, i);
+            q.push_back((i as f64, crate::util::SendBox(pb)));
+            // Emission is at frame 2: nothing newer than 2.5 may become current.
+            Sink::cap(&mut q, &mut last, 4, 2.5);
+        }
+        let cur = ids[&(CFRetained::as_ptr(&last.as_ref().unwrap().0).as_ptr() as usize)];
+        assert_eq!(cur, 2, "current frame stays due, later ones are skipped");
+        assert_eq!(q.len(), 4);
     }
 
     #[test]
