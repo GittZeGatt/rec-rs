@@ -20,7 +20,7 @@ use compose::{Corner, PipSpec, Shape};
 use writer::Codec;
 
 #[derive(Parser)]
-#[command(name = "rec", version, about = "Native macOS screen recorder (ScreenCaptureKit + VideoToolbox + AVAssetWriter)")]
+#[command(name = "rec-rs", version, about = "Native macOS screen recorder (ScreenCaptureKit + VideoToolbox + AVAssetWriter)")]
 struct Cli {
     /// Without a subcommand, rec starts the menu bar app.
     #[command(subcommand)]
@@ -40,8 +40,12 @@ enum Cmd {
     },
     /// List displays, windows, cameras and microphones.
     Devices,
-    /// Stop a running `rec record` (e.g. from a hotkey) and print its file.
+    /// Stop a running recording (CLI or app) and print its file.
     Stop,
+    /// Pause the running recording (resume with `rec-rs resume`).
+    Pause,
+    /// Resume a paused recording.
+    Resume,
     /// Show (and optionally request) screen, microphone and camera permissions.
     Permissions {
         /// Trigger the system permission prompts for anything not yet granted.
@@ -58,10 +62,10 @@ enum Cmd {
 #[derive(Args)]
 pub struct RecordArgs {
     /// Output file (.mov or .mp4). Default: ~/Movies/rec-<timestamp>.mov
-    #[arg(short, long)]
+    #[arg(short, long, visible_alias = "out")]
     output: Option<PathBuf>,
-    /// Display index from `rec devices` (0 = main display).
-    #[arg(short, long, default_value_t = 0)]
+    /// Display number from `rec-rs devices` (1 = main display).
+    #[arg(short, long, default_value_t = 1)]
     display: usize,
     /// Record only this region of the display: X,Y,WIDTH,HEIGHT in points
     /// from the display's top-left corner.
@@ -86,18 +90,27 @@ pub struct RecordArgs {
     /// Video bitrate in Mb/s. Default scales with resolution and fps.
     #[arg(long)]
     bitrate: Option<f64>,
+    /// Record system audio (the default; see --no-system-audio).
+    #[arg(long, overrides_with = "no_system_audio")]
+    system_audio: bool,
     /// Do not record system audio.
     #[arg(long)]
     no_system_audio: bool,
-    /// Microphone: unique ID or name substring (default: system default mic).
+    /// Microphone: `default`, a unique ID or a name substring
+    /// (default: the system default mic).
     #[arg(long, value_name = "DEVICE")]
     mic: Option<String>,
     /// Do not record the microphone.
     #[arg(long, conflicts_with = "mic")]
     no_mic: bool,
     /// Overlay a webcam (optionally: unique ID or name substring).
-    #[arg(short, long, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
+    #[arg(short, long, visible_alias = "cam", value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
     webcam: Option<String>,
+    /// Scene: screen, screen-cam (picture-in-picture) or cam (webcam full
+    /// frame). Default: screen-cam with a webcam, else screen. A camera
+    /// scene turns the webcam on.
+    #[arg(long, value_enum)]
+    scene: Option<compose::Scene>,
     /// Webcam overlay width as a fraction of the frame width.
     #[arg(long, default_value_t = 0.22)]
     pip_size: f64,
@@ -133,8 +146,9 @@ pub struct RecordArgs {
     #[arg(long, value_enum, default_value_t = record::MicBackend::Sck)]
     mic_backend: record::MicBackend,
     /// Record a generated test pattern instead of the screen (self-test;
-    /// needs no Screen Recording permission). Implies --no-system-audio and
-    /// --mic-backend avcapture.
+    /// needs no Screen Recording permission). The frame flashes white once a
+    /// second and the "system audio" beeps at the same instant, for sync
+    /// checks. Implies --mic-backend avcapture.
     #[arg(long)]
     test_pattern: bool,
     /// With --test-pattern: add random noise blocks to stress the encoder.
@@ -187,9 +201,13 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
     let mic = if a.no_mic {
         None
     } else {
-        Some(a.mic.as_deref().map(camera::resolve_mic).transpose()?)
+        Some(a.mic.as_deref().filter(|m| *m != "default").map(camera::resolve_mic).transpose()?)
     };
-    let webcam = a.webcam.map(|s| if s.is_empty() { None } else { Some(s) });
+    let mut webcam = a.webcam.map(|s| if s.is_empty() || s == "default" { None } else { Some(s) });
+    let scene = a.scene.unwrap_or(if webcam.is_some() { compose::Scene::ScreenCam } else { compose::Scene::Screen });
+    if scene.uses_cam() && webcam.is_none() {
+        webcam = Some(None);
+    }
     let mut opts = record::Options {
         output: a.output.unwrap_or_else(default_output),
         size: (0, 0),
@@ -208,10 +226,8 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         audio_layout: a.audio_tracks,
         gains_db: [a.system_gain, a.mic_gain],
         mic_backend: if a.test_pattern { record::MicBackend::Avcapture } else { a.mic_backend },
+        scene,
     };
-    if a.test_pattern {
-        opts.system_audio = false;
-    }
     record::check_permissions(&opts)?;
     if !(1..=240).contains(&a.fps) || 60000 % a.fps != 0 {
         bail!("--fps must divide 60000 (e.g. 24, 25, 30, 50, 60, 120)");
@@ -220,10 +236,10 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         (None, (3840, 2160))
     } else {
         let mut displays = screen::displays()?;
-        if a.display >= displays.len() {
-            bail!("display {} not found ({} available, see `rec devices`)", a.display, displays.len());
+        if a.display == 0 || a.display > displays.len() {
+            bail!("display {} not found: displays are numbered 1..={} (see `rec-rs devices`)", a.display, displays.len());
         }
-        let d = displays.swap_remove(a.display);
+        let d = displays.swap_remove(a.display - 1);
         let scale = d.pixels.0 as f64 / d.points.0.max(1) as f64;
         if let Some(sel) = &a.window {
             let w = screen::find_window(sel)?;
@@ -273,7 +289,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
 
 /// Parse a `rec record ...` argument list (used by the GUI).
 pub fn parse_record_args(args: &[&str]) -> Result<RecordArgs> {
-    let mut v = vec!["rec", "record"];
+    let mut v = vec!["rec-rs", "record"];
     v.extend_from_slice(args);
     match Cli::try_parse_from(v)?.cmd {
         Some(Cmd::Record(a)) => Ok(a),
@@ -322,8 +338,10 @@ fn devices() -> Result<()> {
         Ok(ds) => {
             for (i, d) in ds.iter().enumerate() {
                 println!(
-                    "  [{i}] id {}  {}x{} pixels ({}x{} points)",
-                    d.id, d.pixels.0, d.pixels.1, d.points.0, d.points.1
+                    "  [{}] id {}  {}x{} pixels ({}x{} points)",
+                    i + 1,
+                    d.id,
+                    d.pixels.0, d.pixels.1, d.points.0, d.points.1
                 );
             }
         }
@@ -359,6 +377,8 @@ fn main() {
         Cmd::Record(a) => record(a),
         Cmd::Devices => devices(),
         Cmd::Stop => record::stop_running(),
+        Cmd::Pause => record::signal_running(true),
+        Cmd::Resume => record::signal_running(false),
         Cmd::Permissions { request, wait } => {
             if request {
                 tcc::request_all(true, true, true, std::time::Duration::from_secs(wait));
@@ -374,5 +394,51 @@ fn main() {
     if let Err(e) = r {
         eprintln!("rec: error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_command_line_parses() {
+        let a = parse_record_args(&[
+            "--display", "1", "--mic", "default", "--system-audio", "--cam", "--out", "file.mp4", "--duration", "10",
+        ])
+        .unwrap();
+        assert_eq!(a.display, 1);
+        assert_eq!(a.mic.as_deref(), Some("default"));
+        assert!(a.system_audio && !a.no_system_audio);
+        assert_eq!(a.webcam.as_deref(), Some(""));
+        assert_eq!(a.output, Some(PathBuf::from("file.mp4")));
+        assert_eq!(a.duration, Some(10.0));
+    }
+
+    #[test]
+    fn system_audio_flags_override_each_other() {
+        let a = parse_record_args(&["--system-audio", "--no-system-audio"]).unwrap();
+        assert!(a.no_system_audio);
+        let a = parse_record_args(&["--no-system-audio", "--system-audio"]).unwrap();
+        assert!(!a.no_system_audio);
+    }
+
+    #[test]
+    fn sizes() {
+        let native = (3456, 2234);
+        assert_eq!(parse_size("1080p", native, false).unwrap(), (1920, 1080));
+        assert_eq!(parse_size("4K", native, false).unwrap(), (3840, 2160));
+        assert_eq!(parse_size("native", native, false).unwrap(), native);
+        assert_eq!(parse_size("1280x720", native, false).unwrap(), (1280, 720));
+        // keep-aspect shrinks to the display's 1.547 aspect, even sizes.
+        assert_eq!(parse_size("1080p", native, true).unwrap(), (1670, 1080));
+        assert!(parse_size("huge", native, false).is_err());
+    }
+
+    #[test]
+    fn scene_option() {
+        let a = parse_record_args(&["--scene", "cam"]).unwrap();
+        assert_eq!(a.scene, Some(compose::Scene::Cam));
+        assert!(parse_record_args(&["--scene", "nope"]).is_err());
     }
 }

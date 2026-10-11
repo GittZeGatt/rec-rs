@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 
 use crate::camera::{self, Camera, Mic};
 use crate::synth::Synth;
-use crate::compose::{Compositor, PipSpec};
+use crate::compose::{Compositor, PipSpec, Scene};
 use crate::screen::{self, ScreenCapture, ScreenConfig};
 use crate::tcc::{self, Status};
 use crate::util::*;
@@ -39,6 +39,24 @@ impl Shared {
 
 /// Set by SIGINT/SIGTERM/SIGHUP in CLI mode.
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Pause/resume requests (SIGUSR1/SIGUSR2 from `rec-rs pause`/`resume`).
+pub static PAUSE_REQ: AtomicBool = AtomicBool::new(false);
+pub static RESUME_REQ: AtomicBool = AtomicBool::new(false);
+
+pub extern "C" fn on_pause_signal(sig: libc::c_int) {
+    if sig == libc::SIGUSR1 {
+        PAUSE_REQ.store(true, Ordering::SeqCst);
+    } else {
+        RESUME_REQ.store(true, Ordering::SeqCst);
+    }
+}
+
+pub fn install_pause_signals() {
+    unsafe {
+        libc::signal(libc::SIGUSR1, on_pause_signal as *const () as usize);
+        libc::signal(libc::SIGUSR2, on_pause_signal as *const () as usize);
+    }
+}
 static SIGNALS: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn on_signal(_: libc::c_int) {
@@ -69,6 +87,8 @@ pub struct Options {
     /// Gain in dB for [system, mic] in the mix track.
     pub gains_db: [f32; 2],
     pub mic_backend: MicBackend,
+    /// Initial scene (only Screen without a webcam).
+    pub scene: Scene,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -121,7 +141,8 @@ impl Session {
         let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
-        let sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, preview)?;
+        let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, o.scene, preview)?;
+        sink.limit_secs(o.duration);
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None), stop: stop.clone() });
         let mut sess = Session {
@@ -190,7 +211,7 @@ impl Session {
         }
         match (o.test_pattern, target) {
             (Some(noise), _) => {
-                self.synth = Some(Synth::start(w, h, o.fps, pixel_format, noise, self.shared.clone()));
+                self.synth = Some(Synth::start(w, h, o.fps, pixel_format, noise, o.system_audio, self.shared.clone()));
                 self.description = format!("test pattern{}", if noise { " (noise)" } else { "" });
             }
             (None, Some(target)) => {
@@ -246,6 +267,37 @@ impl Session {
         ok
     }
 
+    pub fn pause(&self) -> bool {
+        let mut ok = false;
+        self.shared.with(|s| ok = s.pause(secs(host_now())));
+        ok
+    }
+
+    pub fn resume(&self) -> bool {
+        let mut ok = false;
+        self.shared.with(|s| ok = s.resume(secs(host_now())));
+        ok
+    }
+
+    pub fn is_paused(&self) -> bool {
+        let mut p = false;
+        self.shared.with(|s| p = s.is_paused());
+        p
+    }
+
+    /// Recorded (output) seconds so far, excluding pauses.
+    pub fn recorded_secs(&self) -> f64 {
+        let mut t = 0.0;
+        self.shared.with(|s| t = s.output_secs());
+        t
+    }
+
+    pub fn set_scene(&self, scene: Scene) -> bool {
+        let mut ok = false;
+        self.shared.with(|s| ok = s.set_scene(scene));
+        ok
+    }
+
     /// (stats, peak levels [system, mic] since last call).
     pub fn poll(&self) -> (Stats, [f32; 2]) {
         let mut st = Stats::default();
@@ -292,7 +344,17 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
         Some(None) => "default".to_string(),
         Some(Some(id)) => camera::microphones().into_iter().find(|m| &m.id == id).map(|m| m.name).unwrap_or(id.clone()),
     };
-    let sess = Session::start(&o, target, true, None)?;
+    // Before starting: a pause requested during camera startup still applies.
+    install_pause_signals();
+    let pidfile = pidfile_path();
+    let _ = std::fs::write(&pidfile, format!("{}\n{}\n", std::process::id(), o.output.display()));
+    let sess = match Session::start(&o, target, true, None) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_file(&pidfile);
+            return Err(e);
+        }
+    };
     let (w, h) = o.size;
     if !o.quiet {
         eprintln!(
@@ -311,16 +373,23 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
         eprintln!("rec: press Ctrl-C to stop");
     }
 
-    let pidfile = pidfile_path();
-    let _ = std::fs::write(&pidfile, format!("{}\n{}\n", std::process::id(), o.output.display()));
 
     let mut last_status = Instant::now();
     let mut warned_no_frames = false;
     while !STOP.load(Ordering::SeqCst) && !sess.failed() {
         std::thread::sleep(Duration::from_millis(20));
+        // Requests wait for the first frame (the timeline starts there).
+        if sess.has_frames() && PAUSE_REQ.swap(false, Ordering::SeqCst) && sess.pause() && !o.quiet {
+            eprint!("\r\x1b[2Krec: paused (`rec-rs resume` to continue)\n");
+        }
+        if sess.has_frames() && RESUME_REQ.swap(false, Ordering::SeqCst) && sess.resume() && !o.quiet {
+            eprint!("\r\x1b[2Krec: resumed\n");
+        }
         let el = sess.started.elapsed().as_secs_f64();
+        // --duration counts recorded time, so pauses extend the wall time.
+        let rec_t = if sess.has_frames() { sess.recorded_secs() } else { 0.0 };
         if let Some(d) = o.duration
-            && el >= d
+            && (rec_t >= d || (!sess.has_frames() && el >= d))
         {
             break;
         }
@@ -332,8 +401,9 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
             last_status = Instant::now();
             let (st, lv) = sess.poll();
             eprint!(
-                "\r\x1b[2K  {}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB  ",
-                clock(el),
+                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB  ",
+                clock(rec_t),
+                if sess.is_paused() { " PAUSED" } else { "" },
                 st.video_frames_out,
                 st.video_dups,
                 st.video_drops,
@@ -361,6 +431,17 @@ pub fn db(p: f32) -> String {
 
 pub fn pidfile_path() -> PathBuf {
     std::env::temp_dir().join("rec.pid")
+}
+
+/// Send SIGUSR1 (pause) or SIGUSR2 (resume) to the running recorder.
+pub fn signal_running(pause: bool) -> Result<()> {
+    let text = std::fs::read_to_string(pidfile_path()).map_err(|_| anyhow::anyhow!("no recording in progress"))?;
+    let pid: i32 = text.lines().next().unwrap_or("").trim().parse()?;
+    let sig = if pause { libc::SIGUSR1 } else { libc::SIGUSR2 };
+    if unsafe { libc::kill(pid, sig) } != 0 {
+        bail!("no recording in progress (pid {pid} not running)");
+    }
+    Ok(())
 }
 
 /// Ask a running `rec record` to stop (like Ctrl-C) and wait for it to finish.

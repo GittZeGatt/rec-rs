@@ -130,31 +130,6 @@ fn resample(src: Vec<[f32; 2]>, from: f64) -> Vec<[f32; 2]> {
 
 impl Mixer {
     pub fn new(t0_secs: f64, system: bool, mic: bool, gain_db: [f32; 2]) -> Self {
-        let asbd = AudioStreamBasicDescription {
-            mSampleRate: RATE,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 8,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 8,
-            mChannelsPerFrame: 2,
-            mBitsPerChannel: 32,
-            mReserved: 0,
-        };
-        let mut fd: *const CMAudioFormatDescription = std::ptr::null();
-        let fmt = unsafe {
-            CMAudioFormatDescriptionCreate(
-                None,
-                NonNull::from(&asbd),
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                None,
-                NonNull::from(&mut fd),
-            );
-            CFRetained::from_raw(NonNull::new(fd as *mut CMAudioFormatDescription).expect("audio format"))
-        };
         Mixer {
             t0: (t0_secs * RATE).round() as i64,
             base: 0,
@@ -162,13 +137,12 @@ impl Mixer {
             horizon: [None, None],
             active: [system, mic],
             gain: gain_db.map(|db| 10f32.powf(db / 20.0)),
-            fmt,
+            fmt: stereo_format(),
             clipped: 0,
         }
     }
-
-    pub fn push(&mut self, kind: AudioKind, sb: &CMSampleBuffer) {
-        let Some((pts, rate, frames)) = decode(sb) else { return };
+    /// Add decoded frames that start at `pts` (seconds on the output timeline).
+    pub fn push(&mut self, kind: AudioKind, pts: f64, rate: f64, frames: Vec<[f32; 2]>) {
         let frames = resample(frames, rate);
         let i = idx(kind);
         let mut start = (pts * RATE).round() as i64 - self.t0;
@@ -216,39 +190,144 @@ impl Mixer {
         }
         let pts = unsafe { CMTime::new(self.t0 + self.base, RATE as i32) };
         self.base += n as i64;
-        unsafe {
-            let bytes = data.len() * 4;
-            let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
-            if CMBlockBuffer::create_with_memory_block(
-                None,
-                std::ptr::null_mut(),
-                bytes,
-                None,
-                std::ptr::null(),
-                0,
-                bytes,
-                kCMBlockBufferAssureMemoryNowFlag,
-                NonNull::from(&mut block),
-            ) != 0
-            {
-                return None;
-            }
-            let block = CFRetained::from_raw(NonNull::new(block)?);
-            CMBlockBuffer::replace_data_bytes(NonNull::new(data.as_mut_ptr() as *mut _)?, &block, 0, bytes);
-            let mut out: *mut CMSampleBuffer = std::ptr::null_mut();
-            if CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-                None,
-                &block,
-                &self.fmt,
-                n as isize,
-                pts,
-                std::ptr::null(),
-                NonNull::from(&mut out),
-            ) != 0
-            {
-                return None;
-            }
-            Some(CFRetained::from_raw(NonNull::new(out)?))
+        pcm_buffer(&self.fmt, data, pts)
+    }
+}
+
+/// 48 kHz interleaved stereo f32 PCM.
+pub fn stereo_format() -> CFRetained<CMAudioFormatDescription> {
+    let asbd = AudioStreamBasicDescription {
+        mSampleRate: RATE,
+        mFormatID: kAudioFormatLinearPCM,
+        mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+        mBytesPerPacket: 8,
+        mFramesPerPacket: 1,
+        mBytesPerFrame: 8,
+        mChannelsPerFrame: 2,
+        mBitsPerChannel: 32,
+        mReserved: 0,
+    };
+    let mut fd: *const CMAudioFormatDescription = std::ptr::null();
+    unsafe {
+        CMAudioFormatDescriptionCreate(
+            None,
+            NonNull::from(&asbd),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            None,
+            NonNull::from(&mut fd),
+        );
+        CFRetained::from_raw(NonNull::new(fd as *mut CMAudioFormatDescription).expect("audio format"))
+    }
+}
+
+/// Wrap interleaved stereo samples (`stereo_format`) starting at `pts` in a
+/// sample buffer.
+pub fn pcm_buffer(
+    fmt: &CMAudioFormatDescription,
+    mut data: Vec<f32>,
+    pts: CMTime,
+) -> Option<CFRetained<CMSampleBuffer>> {
+    let n = data.len() / 2;
+    unsafe {
+        let bytes = data.len() * 4;
+        let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
+        if CMBlockBuffer::create_with_memory_block(
+            None,
+            std::ptr::null_mut(),
+            bytes,
+            None,
+            std::ptr::null(),
+            0,
+            bytes,
+            kCMBlockBufferAssureMemoryNowFlag,
+            NonNull::from(&mut block),
+        ) != 0
+        {
+            return None;
         }
+        let block = CFRetained::from_raw(NonNull::new(block)?);
+        CMBlockBuffer::replace_data_bytes(NonNull::new(data.as_mut_ptr() as *mut _)?, &block, 0, bytes);
+        let mut out: *mut CMSampleBuffer = std::ptr::null_mut();
+        if CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            None,
+            &block,
+            fmt,
+            n as isize,
+            pts,
+            std::ptr::null(),
+            NonNull::from(&mut out),
+        ) != 0
+        {
+            return None;
+        }
+        Some(CFRetained::from_raw(NonNull::new(out)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pull_all(m: &mut Mixer, flush: bool) -> (Option<f64>, Vec<[f32; 2]>) {
+        let mut first = None;
+        let mut out = vec![];
+        while let Some(b) = m.pull(flush) {
+            let (pts, rate, frames) = decode(&b).expect("mix buffer decodes");
+            assert_eq!(rate, RATE);
+            first.get_or_insert(pts);
+            out.extend(frames);
+        }
+        (first, out)
+    }
+
+    #[test]
+    fn sums_sources_on_a_shared_timeline() {
+        let mut m = Mixer::new(10.0, true, true, [0.0, 0.0]);
+        m.push(AudioKind::System, 10.0, RATE, vec![[0.25, 0.25]; 480]);
+        // Nothing until the mic reaches the same point (it may still arrive).
+        assert!(m.pull(false).is_none());
+        // Mic starts 5 ms later, mono duplicated to both channels.
+        m.push(AudioKind::Mic, 10.005, RATE, vec![[0.5, 0.5]; 480]);
+        let (pts, out) = pull_all(&mut m, false);
+        assert_eq!(pts, Some(10.0));
+        assert_eq!(out.len(), 480, "only up to the slower source's horizon");
+        assert_eq!(out[0], [0.25, 0.25]);
+        assert_eq!(out[240], [0.75, 0.75], "overlap is summed");
+        let (pts, rest) = pull_all(&mut m, true);
+        assert_eq!(pts, Some(10.01));
+        assert_eq!(rest.len(), 240);
+        assert_eq!(rest[0], [0.5, 0.5]);
+    }
+
+    #[test]
+    fn gain_and_clipping() {
+        let mut m = Mixer::new(0.0, false, true, [0.0, 6.0]);
+        m.push(AudioKind::Mic, 0.0, RATE, vec![[0.4, -0.6]; 100]);
+        let (_, out) = pull_all(&mut m, true);
+        assert!((out[0][0] - 0.798).abs() < 0.01);
+        assert_eq!(out[0][1], -1.0);
+        assert_eq!(m.clipped, 100);
+    }
+
+    #[test]
+    fn small_jitter_snaps_to_continuous() {
+        let mut m = Mixer::new(0.0, true, false, [0.0, 0.0]);
+        m.push(AudioKind::System, 0.0, RATE, vec![[0.1, 0.1]; 480]);
+        // 1 ms late: within SNAP, so no gap of silence is inserted.
+        m.push(AudioKind::System, 0.011, RATE, vec![[0.1, 0.1]; 480]);
+        let (_, out) = pull_all(&mut m, true);
+        assert_eq!(out.len(), 960);
+        assert!(out.iter().all(|f| f[0] == 0.1));
+    }
+
+    #[test]
+    fn resample_44k1_to_48k() {
+        let src: Vec<[f32; 2]> = (0..441).map(|i| [i as f32, i as f32]).collect();
+        let out = resample(src, 44100.0);
+        assert_eq!(out.len(), 480);
+        assert_eq!(out[0], [0.0, 0.0]);
     }
 }

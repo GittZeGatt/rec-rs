@@ -73,7 +73,7 @@ pub fn resolve_mic(sel: &str) -> Result<String> {
     mics.iter()
         .find(|m| m.name.to_lowercase().contains(&lower))
         .map(|m| m.id.clone())
-        .ok_or_else(|| anyhow!("no microphone matches {sel:?} (see `rec devices`)"))
+        .ok_or_else(|| anyhow!("no microphone matches {sel:?} (see `rec-rs devices`)"))
 }
 
 pub struct CamIvars {
@@ -131,7 +131,7 @@ impl Camera {
                 })
             }
         }
-        .ok_or_else(|| anyhow!("no camera found (see `rec devices`)"))?;
+        .ok_or_else(|| anyhow!("no camera found (see `rec-rs devices`)"))?;
         unsafe {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();

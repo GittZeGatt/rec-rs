@@ -14,7 +14,7 @@ STAGE=dist/.Rec.app.new
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS"
 cp support/Info.plist "$STAGE/Contents/Info.plist"
-cp "$CARGO_TARGET_DIR/$PROFILE/rec" "$STAGE/Contents/MacOS/rec"
+cp "$CARGO_TARGET_DIR/$PROFILE/rec-rs" "$STAGE/Contents/MacOS/rec-rs"
 IDENTITY="${REC_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development|Developer ID Application/ {print $2; exit}')}"
 if [ -z "$IDENTITY" ]; then
   echo "warning: no signing identity found; ad-hoc signing (permissions reset on every rebuild)" >&2
@@ -24,11 +24,13 @@ codesign --force --sign "$IDENTITY" --identifier com.heyfabrika.rec "$STAGE"
 codesign --verify --strict "$STAGE"
 mkdir -p "$APP/Contents/MacOS"
 cp "$STAGE/Contents/Info.plist" "$APP/Contents/Info.plist.new" && mv -f "$APP/Contents/Info.plist.new" "$APP/Contents/Info.plist"
-mv -f "$STAGE/Contents/MacOS/rec" "$APP/Contents/MacOS/rec"
+mv -f "$STAGE/Contents/MacOS/rec-rs" "$APP/Contents/MacOS/rec-rs"
+rm -f "$APP/Contents/MacOS/rec"  # pre-rename executable
 rm -rf "$APP/Contents/_CodeSignature"
 mv "$STAGE/Contents/_CodeSignature" "$APP/Contents/_CodeSignature"
 rm -rf "$STAGE"
 codesign --verify --strict "$APP"
-ln -sf "Rec.app/Contents/MacOS/rec" dist/rec
+ln -sf "Rec.app/Contents/MacOS/rec-rs" dist/rec-rs
+ln -sf rec-rs dist/rec  # short alias
 echo "built $APP (signed: $IDENTITY)"
-echo "run:   dist/rec --help"
+echo "run:   dist/rec-rs --help"

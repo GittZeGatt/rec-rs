@@ -102,13 +102,13 @@ pub fn find_window(sel: &str) -> Result<WindowInfo> {
         if let Some(w) = ws.into_iter().find(|w| w.id == id) {
             return Ok(w);
         }
-        bail!("no on-screen window with id {id} (see `rec devices`)");
+        bail!("no on-screen window with id {id} (see `rec-rs devices`)");
     }
     let lower = sel.to_lowercase();
     ws.into_iter()
         .filter(|w| format!("{} {}", w.app, w.title).to_lowercase().contains(&lower))
         .max_by(|a, b| (a.size.0 * a.size.1).total_cmp(&(b.size.0 * b.size.1)))
-        .ok_or_else(|| anyhow!("no on-screen window matches {sel:?} (see `rec devices`)"))
+        .ok_or_else(|| anyhow!("no on-screen window matches {sel:?} (see `rec-rs devices`)"))
 }
 
 pub enum Target {

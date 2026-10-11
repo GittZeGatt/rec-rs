@@ -24,7 +24,7 @@ use objc2_core_video::{
 };
 use objc2_foundation::NSURL;
 
-use crate::compose::Compositor;
+use crate::compose::{Compositor, Scene};
 use crate::mixer::Mixer;
 use crate::util::*;
 
@@ -79,11 +79,99 @@ pub struct Stats {
     pub audio_drops: u64,
     pub audio_mix_buffers: u64,
     pub audio_clipped_samples: u64,
+    /// Grid slots skipped while paused.
+    pub paused_slots: u64,
     /// Arrival latency (host now - capture pts), max and sum, in seconds.
     pub screen_latency_max: f64,
     pub screen_latency_sum: f64,
     pub cam_latency_max: f64,
     pub cam_latency_sum: f64,
+}
+
+/// Pause spans on the real frame grid, in slot indices `[pause, resume)`.
+/// Everything captured inside a span is dropped and everything after it is
+/// shifted earlier by the span's length, so the output has no gap. Spans are
+/// whole slots, which keeps the video grid exact across pauses.
+#[derive(Default, Debug, Clone)]
+pub struct Pauses {
+    spans: Vec<(i64, Option<i64>)>,
+}
+
+impl Pauses {
+    pub fn is_paused(&self) -> bool {
+        self.spans.last().is_some_and(|s| s.1.is_none())
+    }
+
+    /// Pause from `slot` on. Returns false if already paused.
+    pub fn pause(&mut self, slot: i64) -> bool {
+        if self.is_paused() {
+            return false;
+        }
+        let floor = self.spans.last().and_then(|s| s.1).unwrap_or(0);
+        self.spans.push((slot.max(floor), None));
+        true
+    }
+
+    /// Resume at `slot`. Returns false if not paused.
+    pub fn resume(&mut self, slot: i64) -> bool {
+        let Some(last) = self.spans.last_mut() else { return false };
+        if last.1.is_some() {
+            return false;
+        }
+        if slot <= last.0 {
+            self.spans.pop(); // resumed before the pause took effect
+        } else {
+            last.1 = Some(slot);
+        }
+        true
+    }
+
+    /// Slots to shift a capture at real grid position `slot` (fractional for
+    /// audio), or None if it falls inside a pause and must be dropped.
+    pub fn offset_at(&self, slot: f64) -> Option<i64> {
+        let mut off = 0;
+        for &(p, r) in &self.spans {
+            if slot < p as f64 {
+                break;
+            }
+            match r {
+                Some(r) if slot >= r as f64 => off += r - p,
+                _ => return None,
+            }
+        }
+        Some(off)
+    }
+
+    /// The longest part of a capture spanning real slots `[a, b)` that lies
+    /// outside pauses: `(from, to, offset)`. None if it is entirely paused.
+    pub fn keep(&self, a: f64, b: f64) -> Option<(f64, f64, i64)> {
+        let mut best: Option<(f64, f64, i64)> = None;
+        let mut from = f64::NEG_INFINITY;
+        let mut off = 0;
+        let mut consider = |lo: f64, hi: f64, off: i64| {
+            let (x, y) = (lo.max(a), hi.min(b));
+            if y > x && best.is_none_or(|(p, q, _)| y - x > q - p) {
+                best = Some((x, y, off));
+            }
+        };
+        for &(p, r) in &self.spans {
+            consider(from, p as f64, off);
+            match r {
+                Some(r) => {
+                    off += r - p;
+                    from = r as f64;
+                }
+                None => return best,
+            }
+        }
+        consider(from, f64::INFINITY, off);
+        best
+    }
+
+    /// Total paused slots (closed spans only).
+    pub fn total(&self) -> i64 {
+        self.spans.iter().filter_map(|&(p, r)| r.map(|r| r - p)).sum()
+    }
 }
 
 type Pb = SendBox<CFRetained<CVPixelBuffer>>;
@@ -113,6 +201,12 @@ pub struct Sink {
     /// Session start on the host clock, in TIMESCALE units.
     t0: Option<i64>,
     next_slot: i64,
+    /// Next slot on the output timeline (real slots minus paused ones).
+    out_slot: i64,
+    pauses: Pauses,
+    scene: Scene,
+    /// Stop writing after this many output slots (exact `--duration`).
+    limit: Option<i64>,
     screen_q: VecDeque<(f64, Pb)>,
     screen_last: Option<Pb>,
     cam_q: VecDeque<(f64, Pb)>,
@@ -188,6 +282,7 @@ impl Sink {
         layout: AudioLayout,
         gains_db: [f32; 2],
         compositor: Option<Compositor>,
+        scene: Scene,
         preview: Option<PreviewFn>,
     ) -> Result<Self> {
         let out = match path {
@@ -209,6 +304,10 @@ impl Sink {
             fps: v.fps as i64,
             t0: None,
             next_slot: 0,
+            out_slot: 0,
+            pauses: Pauses::default(),
+            scene: if compositor.is_some() { scene } else { Scene::Screen },
+            limit: None,
             screen_q: VecDeque::new(),
             screen_last: None,
             cam_q: VecDeque::new(),
@@ -242,7 +341,64 @@ impl Sink {
     }
 
     fn slot_ticks(&self, slot: i64) -> i64 {
-        self.t0.unwrap() + slot * TIMESCALE as i64 / self.fps
+        self.t0.unwrap() + slot * self.tps()
+    }
+
+    /// TIMESCALE ticks per frame slot (fps divides TIMESCALE).
+    fn tps(&self) -> i64 {
+        TIMESCALE as i64 / self.fps
+    }
+
+    /// First grid slot at or after host time `t` (seconds).
+    fn slot_at(&self, t: f64) -> i64 {
+        let ticks = t * TIMESCALE as f64 - self.t0.unwrap() as f64;
+        (ticks / self.tps() as f64).ceil() as i64
+    }
+
+    /// Switch scenes live. Scenes with the camera need a compositor (the
+    /// session was started with a webcam); returns false otherwise.
+    pub fn set_scene(&mut self, scene: Scene) -> bool {
+        if self.compositor.is_none() && scene != Scene::Screen {
+            return false;
+        }
+        self.scene = scene;
+        true
+    }
+
+    pub fn scene(&self) -> Scene {
+        self.scene
+    }
+
+    /// Pause at host time `now`: nothing captured from the next frame slot on
+    /// is written until `resume`. The preview keeps running.
+    pub fn pause(&mut self, now: f64) -> bool {
+        if self.t0.is_none() {
+            return false;
+        }
+        let slot = self.slot_at(now).max(self.next_slot);
+        self.pauses.pause(slot)
+    }
+
+    pub fn resume(&mut self, now: f64) -> bool {
+        if self.t0.is_none() {
+            return false;
+        }
+        let slot = self.slot_at(now).max(self.next_slot);
+        self.pauses.resume(slot)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pauses.is_paused()
+    }
+
+    /// Write at most `secs` of output (rounded to whole frames).
+    pub fn limit_secs(&mut self, secs: Option<f64>) {
+        self.limit = secs.map(|d| (d * self.fps as f64).round() as i64);
+    }
+
+    /// Seconds of output written so far (excludes paused time).
+    pub fn output_secs(&self) -> f64 {
+        self.out_slot as f64 / self.fps as f64
     }
 
     pub fn push_screen(&mut self, pts: CMTime, pb: CFRetained<CVPixelBuffer>) {
@@ -283,16 +439,37 @@ impl Sink {
     pub fn push_audio(&mut self, kind: AudioKind, sb: &CMSampleBuffer) {
         let Some(t0) = self.t0 else { return };
         let pts = unsafe { sb.presentation_time_stamp() };
-        if secs(pts) * (TIMESCALE as f64) < t0 as f64 {
+        let pts_s = secs(pts);
+        if pts_s * (TIMESCALE as f64) < t0 as f64 {
             return;
         }
-        if let Some((_, _, frames)) = crate::mixer::decode(sb) {
+        let i = (kind == AudioKind::Mic) as usize;
+        let decoded = crate::mixer::decode(sb);
+        if let Some((_, _, frames)) = &decoded {
             let peak = frames.iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
-            let i = (kind == AudioKind::Mic) as usize;
             self.levels[i] = self.levels[i].max(peak);
         }
-        if let Some(m) = self.mixer.as_mut() {
-            m.push(kind, sb);
+        // Cut the buffer at pause boundaries (sample-accurate: AVAssetWriter
+        // lays audio buffers end to end, so a dropped or overlapping piece
+        // would shift everything after it).
+        let n = unsafe { sb.num_samples() } as usize;
+        let rate = decoded.as_ref().map_or(48000.0, |d| d.1);
+        let to_slot = |t: f64| (t * TIMESCALE as f64 - t0 as f64) / self.tps() as f64;
+        let (a, b) = (to_slot(pts_s), to_slot(pts_s + n as f64 / rate));
+        let Some((x, y, off)) = self.pauses.keep(a, b) else { return };
+        let slot_secs = 1.0 / self.fps as f64;
+        let mut i0 = (((x - a) * slot_secs * rate).round() as usize).min(n);
+        let mut i1 = (((y - a) * slot_secs * rate).round() as usize).min(n);
+        if (x, y) == (a, b) {
+            (i0, i1) = (0, n);
+        }
+        if i1 <= i0 {
+            return;
+        }
+        let shift = off * self.tps();
+        let out_s = pts_s + i0 as f64 / rate - shift as f64 / TIMESCALE as f64;
+        if let (Some(m), Some((_, rate, frames))) = (self.mixer.as_mut(), decoded) {
+            m.push(kind, out_s, rate, frames[i0.min(frames.len())..i1.min(frames.len())].to_vec());
             self.drain_mix(false);
         }
         let Some(o) = &self.out else { return };
@@ -301,8 +478,23 @@ impl Sink {
             AudioKind::Mic => o.mic.as_ref(),
         };
         let Some(input) = input else { return };
+        let retimed;
+        let buf: &CMSampleBuffer = if shift == 0 && (i0, i1) == (0, n) {
+            sb
+        } else {
+            match retime(sb, i0, i1, shift) {
+                Some(b) => {
+                    retimed = b;
+                    &retimed
+                }
+                None => {
+                    self.stats.audio_drops += 1;
+                    return;
+                }
+            }
+        };
         unsafe {
-            if input.isReadyForMoreMediaData() && input.appendSampleBuffer(sb) {
+            if input.isReadyForMoreMediaData() && input.appendSampleBuffer(buf) {
                 match kind {
                     AudioKind::System => self.stats.audio_sys_buffers += 1,
                     AudioKind::Mic => self.stats.audio_mic_buffers += 1,
@@ -368,7 +560,8 @@ impl Sink {
         }
         let half = 0.5 / self.fps as f64;
         loop {
-            let slot_t = self.slot_ticks(self.next_slot) as f64 / TIMESCALE as f64;
+            let slot = self.next_slot;
+            let slot_t = self.slot_ticks(slot) as f64 / TIMESCALE as f64;
             if slot_t > until {
                 break;
             }
@@ -376,43 +569,61 @@ impl Sink {
             Self::pick(&mut self.screen_q, &mut self.screen_last, slot_t + half);
             let fresh = self.screen_q.len() != before;
             Self::pick(&mut self.cam_q, &mut self.cam_last, slot_t + half);
-            let pts = unsafe { CMTime::new(self.slot_ticks(self.next_slot), TIMESCALE) };
             self.next_slot += 1;
-            let Some(screen) = self.screen_last.as_ref().map(|s| s.0.clone()) else { continue };
-            if let Some(o) = &self.out
+            let write = self.pauses.offset_at(slot as f64).is_some() && self.limit.is_none_or(|l| self.out_slot < l);
+            if !write {
+                self.stats.paused_slots += 1;
+            }
+            let want_preview = self.preview.is_some() && slot_t - self.last_preview >= 1.0 / 30.0;
+            if !write && !want_preview {
+                continue;
+            }
+            let screen = self.screen_last.as_ref().map(|s| s.0.clone());
+            if screen.is_none() && self.scene != Scene::Cam {
+                continue;
+            }
+            if write
+                && let Some(o) = &self.out
                 && !unsafe { o.video.isReadyForMoreMediaData() }
             {
                 self.stats.video_drops += 1;
+                self.out_slot += 1;
                 self.check_writer();
                 continue;
             }
             let frame: CFRetained<CVPixelBuffer> = if self.compositor.is_some() {
                 let Some(buf) = self.new_output_buffer() else {
-                    self.stats.video_drops += 1;
+                    if write {
+                        self.stats.video_drops += 1;
+                        self.out_slot += 1;
+                    }
                     continue;
                 };
                 let cam = self.cam_last.as_ref().map(|b| b.0.clone());
-                self.compositor.as_mut().unwrap().render(&screen, cam.as_deref(), &buf);
+                let scene = self.scene;
+                self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam.as_deref(), &buf);
                 buf
             } else {
-                screen
+                screen.unwrap()
             };
-            if let Some(o) = &self.out {
-                if unsafe { o.adaptor.appendPixelBuffer_withPresentationTime(&frame, pts) } {
-                    self.stats.video_frames_out += 1;
-                    if !fresh {
-                        self.stats.video_dups += 1;
+            if write {
+                let pts = unsafe { CMTime::new(self.slot_ticks(self.out_slot), TIMESCALE) };
+                self.out_slot += 1;
+                if let Some(o) = &self.out {
+                    if unsafe { o.adaptor.appendPixelBuffer_withPresentationTime(&frame, pts) } {
+                        self.stats.video_frames_out += 1;
+                        if !fresh {
+                            self.stats.video_dups += 1;
+                        }
+                    } else {
+                        self.stats.video_drops += 1;
+                        self.check_writer();
                     }
                 } else {
-                    self.stats.video_drops += 1;
-                    self.check_writer();
+                    self.stats.video_frames_out += 1;
                 }
-            } else {
-                self.stats.video_frames_out += 1;
             }
-            if let Some(p) = &self.preview
-                && slot_t - self.last_preview >= 1.0 / 30.0
-            {
+            if want_preview && let Some(p) = &self.preview {
                 self.last_preview = slot_t;
                 p(frame);
             }
@@ -442,7 +653,7 @@ impl Sink {
         self.preview = None;
         self.emit_until(end);
         self.drain_mix(true);
-        let end_t = unsafe { CMTime::new(self.slot_ticks(self.next_slot), TIMESCALE) };
+        let end_t = unsafe { CMTime::new(self.slot_ticks(self.out_slot), TIMESCALE) };
         let o = self.out.as_ref().unwrap();
         unsafe {
             o.writer.endSessionAtSourceTime(end_t);
@@ -548,6 +759,39 @@ fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout
     }
 }
 
+/// Copy samples `[i0, i1)` of an audio buffer with timestamps moved `shift`
+/// ticks earlier.
+fn retime(sb: &CMSampleBuffer, i0: usize, i1: usize, shift: i64) -> Option<CFRetained<CMSampleBuffer>> {
+    unsafe {
+        let part;
+        let sb = if (i0, i1) == (0, sb.num_samples() as usize) {
+            sb
+        } else {
+            let mut out: *mut CMSampleBuffer = std::ptr::null_mut();
+            let range = objc2_core_foundation::CFRange { location: i0 as _, length: (i1 - i0) as _ };
+            if CMSampleBuffer::copy_sample_buffer_for_range(None, sb, range, std::ptr::NonNull::from(&mut out)) != 0 {
+                return None;
+            }
+            part = CFRetained::from_raw(std::ptr::NonNull::new(out)?);
+            &*part
+        };
+        let pts = sb.presentation_time_stamp().subtract(CMTime::new(shift, TIMESCALE));
+        let n = sb.num_samples().max(1);
+        let dur = sb.duration();
+        let per = CMTime::new(dur.value / n as i64, dur.timescale);
+        let timing = objc2_core_media::CMSampleTimingInfo {
+            duration: per,
+            presentationTimeStamp: pts,
+            decodeTimeStamp: objc2_core_media::kCMTimeInvalid,
+        };
+        let mut out: *mut CMSampleBuffer = std::ptr::null_mut();
+        if CMSampleBuffer::create_copy_with_new_timing(None, sb, 1, &timing, std::ptr::NonNull::from(&mut out)) != 0 {
+            return None;
+        }
+        std::ptr::NonNull::new(out).map(|b| CFRetained::from_raw(b))
+    }
+}
+
 fn err_text(w: &AVAssetWriter) -> String {
     unsafe {
         w.error()
@@ -560,5 +804,74 @@ fn err_text(w: &AVAssetWriter) -> String {
                 s
             })
             .unwrap_or_else(|| "unknown error".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pauses;
+
+    #[test]
+    fn no_pauses_means_no_offset() {
+        let p = Pauses::default();
+        assert_eq!(p.offset_at(0.0), Some(0));
+        assert_eq!(p.offset_at(1e6), Some(0));
+        assert!(!p.is_paused());
+    }
+
+    #[test]
+    fn pause_drops_span_and_shifts_later_captures() {
+        let mut p = Pauses::default();
+        assert!(p.pause(100));
+        assert!(!p.pause(120), "double pause is a no-op");
+        assert!(p.is_paused());
+        assert_eq!(p.offset_at(99.9), Some(0));
+        assert_eq!(p.offset_at(100.0), None);
+        assert_eq!(p.offset_at(5000.0), None, "open span drops everything after it");
+        assert!(p.resume(160));
+        assert_eq!(p.offset_at(159.5), None);
+        assert_eq!(p.offset_at(160.0), Some(60));
+        assert_eq!(p.total(), 60);
+        assert!(p.pause(200));
+        assert!(p.resume(230));
+        assert_eq!(p.offset_at(180.0), Some(60));
+        assert_eq!(p.offset_at(231.0), Some(90));
+        assert_eq!(p.total(), 90);
+    }
+
+    #[test]
+    fn output_slots_stay_contiguous_across_pauses() {
+        let mut p = Pauses::default();
+        p.pause(10);
+        p.resume(25);
+        p.pause(30);
+        p.resume(31);
+        let out: Vec<i64> = (0..40).filter_map(|s| p.offset_at(s as f64).map(|o| s - o)).collect();
+        assert_eq!(out, (0..out.len() as i64).collect::<Vec<_>>());
+        assert_eq!(out.len(), 40 - 15 - 1);
+    }
+
+    #[test]
+    fn keep_cuts_captures_at_pause_boundaries() {
+        let mut p = Pauses::default();
+        assert_eq!(p.keep(1.0, 2.0), Some((1.0, 2.0, 0)));
+        p.pause(10);
+        assert_eq!(p.keep(9.4, 10.6), Some((9.4, 10.0, 0)), "tail inside the pause is cut");
+        assert_eq!(p.keep(10.0, 11.0), None);
+        p.resume(20);
+        assert_eq!(p.keep(19.5, 20.7), Some((20.0, 20.7, 10)), "head inside the pause is cut");
+        assert_eq!(p.keep(30.0, 31.0), Some((30.0, 31.0, 10)));
+        // A capture spanning a whole pause keeps its longer side.
+        assert_eq!(p.keep(9.0, 20.5), Some((9.0, 10.0, 0)));
+    }
+
+    #[test]
+    fn instant_resume_cancels_the_pause() {
+        let mut p = Pauses::default();
+        p.pause(50);
+        assert!(p.resume(50));
+        assert!(!p.is_paused());
+        assert_eq!(p.offset_at(60.0), Some(0));
+        assert!(!p.resume(70), "resume without pause is a no-op");
     }
 }

@@ -26,6 +26,42 @@ pub enum Shape {
     Rect,
 }
 
+/// What the output frame shows. Switchable live while the webcam runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Scene {
+    /// The screen only.
+    Screen,
+    /// The screen with the webcam picture-in-picture.
+    #[default]
+    ScreenCam,
+    /// The webcam full frame.
+    Cam,
+}
+
+impl Scene {
+    pub const ALL: [Scene; 3] = [Scene::Screen, Scene::ScreenCam, Scene::Cam];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Scene::Screen => "Screen",
+            Scene::ScreenCam => "Screen + Camera",
+            Scene::Cam => "Camera",
+        }
+    }
+
+    pub fn uses_cam(self) -> bool {
+        self != Scene::Screen
+    }
+}
+
+/// Uniform scale and offset that fits (`cover` false) or fills (`cover`
+/// true) a `sw`x`sh` source into a `dw`x`dh` canvas, centred.
+pub fn fit(sw: f64, sh: f64, dw: f64, dh: f64, cover: bool) -> (f64, f64, f64) {
+    let (a, b) = (dw / sw, dh / sh);
+    let s = if cover { a.max(b) } else { a.min(b) };
+    (s, (dw - sw * s) / 2.0, (dh - sh * s) / 2.0)
+}
+
 #[derive(Clone, Debug)]
 pub struct PipSpec {
     /// Overlay width as a fraction of the output width.
@@ -82,19 +118,33 @@ impl Compositor {
         m
     }
 
-    pub fn render(&mut self, screen: &CVPixelBuffer, cam: Option<&CVPixelBuffer>, out: &CVPixelBuffer) {
+    pub fn render(&mut self, scene: Scene, screen: Option<&CVPixelBuffer>, cam: Option<&CVPixelBuffer>, out: &CVPixelBuffer) {
         unsafe {
-            let mut img = CIImage::imageWithCVPixelBuffer(screen);
-            let se = img.extent();
-            if se.size.width != self.w || se.size.height != self.h {
-                // Fit screen into the output canvas (should be a no-op: SCK
-                // already delivers the output size).
-                let s = (self.w / se.size.width).min(self.h / se.size.height);
-                let tx = (self.w - se.size.width * s) / 2.0;
-                let ty = (self.h - se.size.height * s) / 2.0;
-                img = img.imageByApplyingTransform(CGAffineTransform { a: s, b: 0.0, c: 0.0, d: s, tx, ty });
+            let canvas = rect(0.0, 0.0, self.w, self.h);
+            let black = CIImage::imageWithColor(&CIColor::colorWithRed_green_blue(0.0, 0.0, 0.0)).imageByCroppingToRect(canvas);
+            if scene == Scene::Cam {
+                let mut img = black;
+                if let Some(cam) = cam {
+                    let c = CIImage::imageWithCVPixelBuffer(cam);
+                    let e = c.extent();
+                    let (s, tx, ty) = fit(e.size.width, e.size.height, self.w, self.h, true);
+                    let (a, tx) = if self.pip.mirror { (-s, self.w - tx) } else { (s, tx) };
+                    let t = CGAffineTransform { a, b: 0.0, c: 0.0, d: s, tx, ty };
+                    img = c.imageByApplyingTransform(t).imageByCroppingToRect(canvas).imageByCompositingOverImage(&img);
+                }
+                self.ctx.render_toCVPixelBuffer_bounds_colorSpace(&img, out, canvas, Some(&self.cs));
+                return;
             }
-            if let Some(cam) = cam {
+            let mut img = black;
+            if let Some(screen) = screen {
+                let sc = CIImage::imageWithCVPixelBuffer(screen);
+                let se = sc.extent();
+                // Fit the screen into the canvas (a no-op normally: SCK
+                // already delivers the output size).
+                let (s, tx, ty) = fit(se.size.width, se.size.height, self.w, self.h, false);
+                img = sc.imageByApplyingTransform(CGAffineTransform { a: s, b: 0.0, c: 0.0, d: s, tx, ty }).imageByCompositingOverImage(&img);
+            }
+            if scene == Scene::ScreenCam && let Some(cam) = cam {
                 let c = CIImage::imageWithCVPixelBuffer(cam);
                 let e = c.extent();
                 let crop = if self.pip.shape == Shape::Circle {
@@ -140,5 +190,19 @@ impl Compositor {
             }
             self.ctx.render_toCVPixelBuffer_bounds_colorSpace(&img, out, rect(0.0, 0.0, self.w, self.h), Some(&self.cs));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn fit_letterboxes_and_cover_crops() {
+        // 4:3 camera into a 16:9 canvas.
+        let (s, tx, ty) = fit(1280.0, 960.0, 1920.0, 1080.0, false);
+        assert_eq!((s, tx, ty), (1.125, 240.0, 0.0));
+        let (s, tx, ty) = fit(1280.0, 960.0, 1920.0, 1080.0, true);
+        assert_eq!((s, tx, ty), (1.5, 0.0, -180.0));
     }
 }
