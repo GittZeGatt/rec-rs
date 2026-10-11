@@ -3,7 +3,9 @@
 A simple, fast, reliable screen and camera recorder for macOS, written in Rust, as an alternative
 to OBS for recording YouTube videos. It records the screen, system audio, microphone and webcam
 into one `.mov` or `.mp4` that plays in QuickTime and imports into Final Cut, Premiere and
-DaVinci Resolve.
+DaVinci Resolve. It can also keep a **replay buffer** of the last seconds and **stream** over
+RTMP/RTMPS (YouTube, Twitch, any server) or WHIP (WebRTC), from one shared hardware encode,
+with or without recording.
 
 It uses only Apple frameworks:
 
@@ -13,6 +15,10 @@ It uses only Apple frameworks:
 - **CoreImage on Metal** for compositing: webcam picture-in-picture and scenes.
 - **VideoToolbox through AVAssetWriter** for hardware H.264, HEVC or ProRes 422, plus AAC
   audio.
+- **VideoToolbox and AudioConverter directly** for the live encode (H.264, AAC, Opus) that feeds
+  the replay buffer and streams. RTMP is a built-in client (TLS through the system's
+  Security framework); WHIP uses [str0m](https://github.com/algesten/str0m) (MIT/Apache) for
+  WebRTC with Apple CryptoKit. Stream keys live in the macOS Keychain.
 
 There is no FFmpeg, OBS or Electron at runtime. The UI is egui on wgpu in the paper-rs style:
 transparent titlebar and the Inter font.
@@ -122,6 +128,19 @@ The **main window** contains:
 - **Record / Stop** (⇧⌘R from anywhere), **Pause / Resume**, the recording timer, and **level
   meters** for system audio and mic with peak hold.
 - **Reveal Last** and **Open Folder**.
+- **Replay buffer**: keep the last 15–300 s (default 60) in memory, shown with its memory use.
+  **Save Replay** or **⇧⌘S** from anywhere writes it to an MP4 in the output folder without
+  stopping anything. ⇧⌘S is only taken while the buffer is on, because it is Save As in most
+  apps.
+- **Stream**: YouTube, Twitch or a custom RTMP/RTMPS or WHIP URL. The stream key is typed once
+  and stored in the Keychain (per destination URL), never in the settings file or logs. **Go
+  Live** / **Stop Stream**, with the stream's duration, bitrate and dropped frames, and a LIVE
+  badge.
+
+  The replay buffer and the stream run with or without a recording. Starting or stopping a
+  recording, or closing the window, doesn't interrupt them: the capture keeps running for them
+  and short gaps while the app swaps capture sessions are bridged (the last frame repeats,
+  silence fills the audio).
 
 The **settings window** (⌘, or the Settings… button) covers:
 
@@ -132,6 +151,8 @@ The **settings window** (⌘, or the Settings… button) covers:
 - Audio devices, track layout and gains.
 - Camera device, plus the overlay: shape, roundness, size, border, shadow, corner presets and
   mirroring.
+- Live encode for the replay buffer and streams: resolution, video bitrate, CBR, keyframe
+  interval and audio bitrate (locked while streaming).
 
 Settings persist in `~/Library/Application Support/rec-rs/settings.json`.
 
@@ -141,7 +162,8 @@ menu bar, and stops the preview. Clicking the Dock icon brings the window back. 
 the Dock, the menu or a logout finalizes a running recording first.
 
 The **menu bar item** shows a red dot and the elapsed time while recording. Its menu has
-Start/Stop, Pause/Resume, Show Window, Settings, Reveal Last, Open Folder and Quit.
+Start/Stop, Pause/Resume, Save Replay, Go Live/Stop Streaming, Show Window, Settings, Reveal
+Last, Open Folder and Quit. While streaming without recording it shows LIVE.
 
 You can also control a running recording, from the app or the CLI, from any shell:
 
@@ -149,6 +171,7 @@ You can also control a running recording, from the app or the CLI, from any shel
 rec-rs pause      # SIGUSR1
 rec-rs resume     # SIGUSR2
 rec-rs stop       # finalizes, prints the file
+rec-rs save-replay  # SIGINFO: write the replay buffer to an MP4
 ```
 
 Quitting the app or sending it SIGTERM mid-recording finalizes the file first.
@@ -198,6 +221,14 @@ frames, and pauses don't count.
 | `-t, --duration` | | Seconds of output. |
 | `--mic-backend` | `sck` | `sck` (ScreenCaptureKit) or `avcapture`. |
 | `--test-pattern [--noise]` | | Synthetic source: the frame flashes white and the "system audio" beeps once a second, for self-tests and sync checks. |
+| `--replay SECS` | off | Keep the last 15–300 s of the live encode in memory; `rec-rs save-replay` writes them to an MP4 next to the output. |
+| `--stream DEST` | | Stream to `youtube`, `twitch`, an `rtmp://`/`rtmps://` URL or a WHIP `http(s)://` URL. Repeatable: one encode feeds every destination. |
+| `--no-record` | | Write no file (replay buffer and/or streaming only). |
+| `--live-resolution` | `1080p` | Live encode size (never above the capture). |
+| `--stream-bitrate` | `6000` | Live video kb/s. |
+| `--keyframe` | `2` | Live keyframe interval in seconds (0.5–4). |
+| `--vbr` | CBR | Average bitrate instead of constant. |
+| `--audio-bitrate` | `160` | Live AAC/Opus kb/s. |
 
 Other commands:
 
@@ -206,6 +237,38 @@ Other commands:
   sample.
 - `rec-rs permissions [--request]` shows or requests the privacy grants.
 - `rec-rs stop`, `rec-rs pause` and `rec-rs resume` control a running recording.
+- `rec-rs save-replay` saves the replay buffer of the running recorder (CLI or app).
+- `rec-rs stream-key DEST [--delete]` stores a stream key in the Keychain (read from the
+  terminal with echo off). `REC_STREAM_KEY` overrides it for one run.
+
+### Replay buffer and streaming
+
+```sh
+rec-rs stream-key youtube                         # once; key goes to the Keychain
+rec-rs record --stream youtube --replay 60        # record, stream and keep a replay buffer
+rec-rs record --no-record --stream rtmp://localhost/live --stream http://localhost:8889/live/whip
+```
+
+- **One encode.** Every composited frame goes once through a real-time VideoToolbox H.264
+  session (High profile, no B-frames, keyframe interval, CBR or average bitrate) together
+  with its own audio mix (AAC; Opus for WHIP). The replay buffer and every stream share it. It
+  keeps running while a recording is paused.
+- **Replay buffer.** Packets are kept from a keyframe, trimmed a GOP at a time. A saved clip
+  passes the video through and re-encodes the audio from the decoded AAC, so QuickTime and
+  ffmpeg agree on its sync. 60 s at 6 Mb/s uses about 45 MB.
+- **RTMP/RTMPS.** Handshake, AMF0 connect/publish, FLV tags, TLS for `rtmps://`. When the
+  network falls behind, video is dropped a GOP at a time (queue over 3 s). Reconnects with
+  backoff (1 s up to 30 s).
+- **WHIP.** SDP offer POSTed with the key as a Bearer token, ICE/DTLS/SRTP on one UDP socket,
+  H.264 + Opus. Packets are sent at their capture time and the session starts with audio and
+  video aligned, so servers that time tracks by arrival (like MediaMTX) stay in sync. The
+  session is DELETEd on stop; a server silent for 5 s triggers a reconnect.
+- **Tested** against a local MediaMTX (`brew install mediamtx`), RTMP, RTMPS and WHIP at
+  once from one encode: A/V offset in the server's own recordings −0.5 ms (RTMP) and within
+  −13 ms (WHIP, of which 6.5 ms is the Opus pre-skip MediaMTX writes into its MP4). Restarting
+  the server reconnects within a few seconds. `scripts/selftest.sh` runs these checks when
+  `mediamtx` is installed. YouTube and Twitch use the same RTMPS path but were not streamed
+  to in testing.
 
 ## Output format
 
@@ -259,14 +322,15 @@ Other commands:
 | 10-bit / HDR | ✅ | ❌ 8-bit SDR, BT.709 |
 | Constant frame rate | ✅ | ✅ exact grid |
 | Crash-safe files | ✅ hybrid/fragmented MP4 | ✅ fragments every 2 s |
-| Pause / resume | ✅ | ✅ sample-accurate |
+| Pause / resume | ✅ | ✅ sample-accurate, app and CLI; the pause is cut from the file, audio stays in sync |
+| Replay buffer | ✅ | ✅ 15–300 s in memory, ⇧⌘S or `save-replay` writes an MP4 without stopping, memory use shown |
+| Streaming | ✅ RTMP, WHIP, SRT, multitrack | ✅ RTMP/RTMPS (YouTube, Twitch, custom) and WHIP, several at once from one encode, auto-reconnect, live status; key in the Keychain |
 | Live preview | ✅ | ✅ |
 | Level meters | ✅ | ✅ peak with hold |
-| Global hotkey | ✅ configurable | ✅ ⇧⌘R (fixed) |
+| Global hotkey | ✅ configurable | ✅ ⇧⌘R record, ⇧⌘S save replay (fixed) |
 | Menu bar control | ❌ | ✅ menu bar item plus Dock app |
 | Headless CLI | ❌ (obs-cli via websocket) | ✅ `rec-rs record …`, `stop`, `pause`, `resume` |
-| Replay buffer, streaming | ✅ | ❌ |
-| Footprint | about 300 MB app | about 16 MB app; about 6% of one core at 4K60 screen-only, about 34% with the webcam overlay (see [PERFORMANCE.md](PERFORMANCE.md)) |
+| Footprint | about 300 MB app | about 22 MB app; about 6% of one core at 4K60 screen-only, about 34% with the webcam overlay (see [PERFORMANCE.md](PERFORMANCE.md)) |
 | Encoder input | frames copied back to the CPU for encoding | IOSurface passed straight to VideoToolbox |
 
 ## Known gaps
@@ -275,8 +339,10 @@ Other commands:
   can only switch live into a camera scene if the recording started with the camera on.
 - **Capture sources.** There is no application capture or multi-display capture. Region capture
   is CLI-only.
-- **Missing features.** There is no replay buffer, no streaming, no audio filters, and the
-  hotkey isn't configurable.
+- **Missing features.** There are no audio filters, and the hotkeys aren't configurable.
+- **Streaming.** RTMP/RTMPS and WHIP only (no SRT, no multitrack/enhanced RTMP). The app
+  streams to one destination at a time; the CLI takes several. The live encode is H.264 8-bit
+  up to 4K. Changing the live encode settings needs the stream stopped.
 - **8-bit SDR only.** HDR displays are tone-mapped by ScreenCaptureKit.
 - **Webcam overlay.** The overlay is burned into the video; there is no separate camera track.
 - **Output latency read once.** It is read when recording starts. Switching output devices
@@ -300,8 +366,9 @@ Other commands:
 | `src/camera.rs` | Webcam and AVCapture mic, device lists |
 | `src/compose.rs` | CoreImage scenes and webcam overlay |
 | `src/mixer.rs` | Real-time audio mixer |
+| `src/live/` | Shared live encode (VideoToolbox H.264, AAC/Opus), replay buffer, RTMP/RTMPS and WHIP outputs, Keychain |
 | `src/tcc.rs` | Permissions and responsibility disclaim |
 | `src/probe.rs` | AVFoundation verification |
 | `src/synth.rs` | Test pattern with flash + beep |
-| `scripts/` | Build, self-test, soak and sync check |
+| `scripts/` | Build, self-test, soak and sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation) |
 | `analysis/OBS_ARCHITECTURE.md` | OBS study |

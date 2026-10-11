@@ -1,5 +1,61 @@
 # PROGRESS
 
+## Pause/resume check, replay buffer and streaming (your request, 2026-10-11 ~12:30): done
+
+- **Pause/resume in the app: verified.** In a scripted run with a 1.5 s pause, the file is
+  3.17 s long against 4.66 s of wall time, and it matches the recording clock. The pause is cut
+  from the file and audio stays in sync. `scripts/selftest.sh` now asserts this, so no fix was
+  needed.
+- **Replay buffer.**
+  - Keeps the last 15–300 s (default 60) of a shared live encode in memory, starting from a
+    keyframe (forced every 2 s by default, configurable 0.5–4 s).
+  - Save it without stopping in any of these ways:
+    - the app's **Save Replay** button (with the memory in use);
+    - **⇧⌘S** from anywhere, held only while the buffer is on;
+    - the menu bar menu;
+    - `rec-rs save-replay` (the CLI flag is `--replay SECS`).
+  - Works with or without a recording, and keeps running with the window closed.
+  - Clips are H.264 + AAC MP4, and both AVFoundation and ffmpeg measure them at **0.0 ms**
+    A/V offset.
+  - Memory: about 45 MB for 60 s at 6 Mb/s.
+- **Streaming.**
+  - **Destinations:** RTMP/RTMPS (YouTube, Twitch, or a custom URL) and WHIP (WebRTC), several
+    at once from **one** VideoToolbox H.264 encode, shared with the replay buffer. Audio is AAC
+    (RTMP) or Opus (WHIP).
+  - **Encode settings:** bitrate, keyframe interval, CBR/VBR, resolution and audio bitrate.
+  - **Resilience:** auto-reconnect with backoff, and a live status showing state, bitrate,
+    dropped frames and duration.
+  - **Stream keys:** stored in the Keychain (`rec-rs stream-key DEST`, or the app's key field),
+    never in settings, and redacted from every log line and error.
+  - **Recording at the same time:** recording and streaming run together. Starting or stopping a
+    recording doesn't interrupt the stream (short capture gaps are bridged).
+- **Tested against a local MediaMTX** (installed with brew; all its files are under
+  `~/Movies/rec-rs-tests/`):
+
+  | Check | Result |
+  |---|---|
+  | RTMP | 1080p60 H.264 High + AAC, **+0.2 ms** in the server's recording |
+  | RTMPS | Self-signed cert (`REC_INSECURE_TLS=1`, for local tests only) |
+  | WHIP | H.264 + Opus, **−3 to −13 ms** (6.5 ms of that is the Opus pre-skip MediaMTX writes into its MP4) |
+  | RTMP + WHIP | Both at once from one encode |
+  | Server restart | Reconnects in about 2–6 s for both |
+  | App | Stream and replay survive window close and a recording start/stop with no gap |
+
+- **Bugs found and fixed along the way.**
+  - The writer could show frames early when its queue overflowed under load, and one latency
+    spike kept output delayed for the rest of a session.
+  - The live encoder session is now created off the capture path.
+  - MediaMTX treats the first packet of each WebRTC track as simultaneous, so WHIP now starts
+    aligned.
+  - The CLI printed "saved" with `--no-record`.
+- **Tests.** `cargo test` passes 48 of 48. `scripts/selftest.sh` passes 17 of 17, including new
+  replay, stream-rtmp, stream-whip and gui-replay cases (the stream cases need `mediamtx`).
+- **Not tested: streaming to the real YouTube or Twitch** (no keys here). They use the same
+  RTMPS path as the local test. A first real stream is worth a short private test. To set up:
+  1. Run `rec-rs stream-key youtube`, or paste the key in the app.
+  2. Choose YouTube and click Go Live.
+- ⇧⌘S overrides Save As in other apps only while the replay buffer is on.
+
 ## Movable camera overlay (your request, 2026-10-11 ~11:00): done
 
 - **Move.** In the Screen + Cam scene, drag the camera in the live preview to any position. It
@@ -141,8 +197,8 @@ permissions granted. The suite covers:
 These are tracked in the README under "Known gaps".
 
 - **Scenes.** There are three fixed scenes, with no layout editor or transitions.
-- **Missing features.** There is no application capture, replay buffer, streaming or audio
-  filters, and the hotkey is fixed.
+- **Missing features.** There is no application capture or audio filters, and the hotkeys
+  are fixed. Streaming is RTMP/RTMPS and WHIP only (no SRT).
 - **8-bit SDR only.**
 
 ## Log
@@ -180,3 +236,6 @@ These are tracked in the README under "Known gaps".
     buffers). The writer now fills audio gaps with silence and trims overlaps.
   - macOS reset the mic and camera grants; re-requested once at 09:12, still pending.
   - Started soak 2 on the fixed build.
+- **2026-10-11 12:30–14:00:** Pause/resume verified in the app; replay buffer; RTMP/RTMPS and
+  WHIP streaming from one shared encode, with Keychain keys, reconnects and live status; app UI,
+  ⇧⌘S and menu items; tested against a local MediaMTX.

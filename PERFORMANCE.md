@@ -135,6 +135,33 @@ ms). This was seen intermittently as -10 ms. The writer now tracks each audio st
 position and fills gaps with silence or trims overlaps to the exact sample, so the error stays
 under 1.5 ms. Audio that arrives before the first frame is held and trimmed rather than dropped.
 
+## Live encode: replay buffer and streaming
+
+30 s of 1080p60 test pattern with noise (worst case for the encoder), CLI, measured with
+`/usr/bin/time -l`:
+
+| Run | CPU time (user + sys) | Peak memory |
+|---|---|---|
+| Recording only | 7.5 s (25% of one core) | 59 MB |
+| Recording + 60 s replay buffer + RTMP stream | 7.1 s (24%) | 169 MB |
+| No file; replay + RTMP + WHIP | 7.1 s (24%) | 123 MB |
+
+The extra H.264 encode runs on the VideoToolbox hardware encoder and costs no measurable CPU.
+Memory grows with the replay buffer: the payload is about bitrate × seconds (60 s at 6 Mb/s is
+about 45 MB, shown in the app). On top of that come the encoder's and the RTMP queue's buffers.
+
+Stream timing, measured on MediaMTX's own recordings with `scripts/synccheck.py`:
+
+| Output | A/V offset |
+|---|---|
+| RTMP | −0.6 to +0.4 ms |
+| WHIP | −0.5 to −12.7 ms, including MediaMTX's 6.5 ms Opus pre-skip; the rest is onset detection on lossy Opus |
+| Replay clip (AVFoundation and ffmpeg) | 0.0 ms |
+
+With a busy CBR stream, WHIP sends only the real picture data. str0m drops the H.264 filler
+units VideoToolbox pads CBR with, so a static screen streams at about 0.5 Mb/s over WebRTC
+and at the full 6 Mb/s over RTMP.
+
 ## Reproduce
 
 ```sh
