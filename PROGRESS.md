@@ -1,5 +1,35 @@
 # PROGRESS
 
+## Movable camera overlay (your request, 2026-10-11 ~11:00): done
+
+- **Move.** In the Screen + Cam scene, drag the camera in the live preview to any position. It
+  snaps to a corner when released within 5% of one, and the ↖ ↗ ↙ ↘ buttons snap it directly.
+  A corner-snapped overlay stays in its corner when resized. The position persists in
+  settings (`pip_place`) and goes into the recording.
+- **Shapes.** Circle, rounded rectangle, square, pill and squircle (a superellipse), shown as
+  icon buttons.
+- **Style.** A roundness slider (0–100%) for rounded, square and squircle, plus size (10–50%),
+  border width and color, drop shadow and mirror.
+- **Live everywhere.** Changes apply in the preview and while recording, without restarting
+  capture. The CoreImage compositor bakes them into the file with no extra encode. The mask,
+  border and shadow are built once per size and style on the CPU (anti-aliased) and reused
+  every frame; dragging only changes a transform.
+- **CLI.** `--pip-pos X,Y`, `--pip-shape circle|rounded|square|pill|squircle`,
+  `--pip-roundness`, `--pip-border`, `--pip-border-color`, `--pip-shadow`.
+- **Tests.**
+  - 11 new unit tests cover placement, clamping, snapping, resize-in-corner, every shape's
+    coverage, border inset, shadow, CLI parsing and settings round trips.
+  - A CoreImage render test bakes an overlay with border into a frame and reads pixels back:
+    camera in the center, border at the edge, rounded corner showing the screen, and a live
+    move.
+  - The app self-test now checks that an overlay change applies without restarting capture.
+  - `cargo test` passes 29 of 29 and `scripts/selftest.sh` passes 13 of 13.
+- **Not verified with your face on camera.** The lid was closed during testing, so the
+  built-in camera delivered no frames. I checked a 30% squircle with a red border and shadow at
+  (0.4, 0.45) through the "Boom Camera" virtual camera instead, both in a recording and in the
+  app preview. A physical drag with the mouse is also untested: dragging uses the same code
+  path as the self-test, but no person has dragged it yet.
+
 ## Status (2026-10-11 ~10:25 EDT)
 
 All 7 milestones of the goal are built and verified by automated tests on this MacBook Pro.
@@ -34,7 +64,7 @@ text (`~/.cache/rec_goal_full.txt`), read on 2026-10-11. Everything listed was r
 | 2 | VideoToolbox H.264 and HEVC (ProRes optional), configurable bitrate/quality, constant frame rate, no dropped frames | **Done** | `--codec h264/hevc/prores`, `--bitrate`. Frame gaps measured at exactly 16.667 ms; 0 dropped frames in every test, including the 30-minute soak. |
 | 3 | Mic plus system audio as separate AAC tracks plus a mixed track; A/V sync from a single clock with capture timestamps, verified by a clap/flash sync test | **Done** | Mix plus two stems. Flash/beep sync test (`scripts/synccheck.py`) measures **0.0 ms** offset, also across pauses. A real-device clap test by a person is optional (see below). |
 | 4 | MP4/MOV via AVAssetWriter, crash-safe, Final Cut/Premiere/DaVinci compatible | **Done; editor import is a manual check** | Fragments every 2 s; SIGKILL leaves a playable file. Output is CFR, BT.709, `hvc1`, standard AAC, which is what editors want. Not yet opened in Resolve by a person. |
-| 5 | Webcam PiP (corner, circle or rounded mask) composited on the GPU; scenes: full screen, screen + cam, cam only | **Done** | CoreImage on Metal. `--scene screen/screen-cam/cam`, switchable live in the app. |
+| 5 | Webcam PiP (corner, circle or rounded mask) composited on the GPU; scenes: full screen, screen + cam, cam only | **Done** | CoreImage on Metal. `--scene screen/screen-cam/cam`, switchable live in the app. The overlay is now draggable, with five shapes, roundness, border and shadow (see above). |
 | 6 | Native UI in paper-rs style (transparent titlebar, Inter, egui) with menu bar icon: pick sources, live preview, start/stop with ⇧⌘R, pause/resume, timer, level meters, settings window; plus a headless CLI | **Done, except the physical ⇧⌘R keypress** | egui/wgpu windows with the paper-rs theme. A scripted app session tests preview, record via the hotkey's command, pause/resume, stop and save, the settings window, and closing the window. The exact CLI line from the goal works and yields 600 frames and 10.000 s. |
 | 7 | Performance and reliability: about 0 dropped frames at 4K60, low CPU, 30-minute soak, ffprobe numbers in PERFORMANCE.md | **Done** | [PERFORMANCE.md](PERFORMANCE.md). Soak 1 (30 min, 4K60, screen + system audio + mic + webcam): 107,955 of 108,000 frames; the 45 drops all came from one 5-s encoder stall, and the writer now retries instead of dropping. Soak 2 on the fixed build (4K60, screen + system audio): **108,000 of 108,000 frames, 0 dropped**, exact 16.667 ms spacing, 6% CPU, flat memory. In both, all tracks ended within 0.1 ms. Soak 3 (webcam, fixed build) was cut by the lid closing at 10:44 (21.7-s display reconfiguration, camera unavailable); the file stayed valid and in sync. |
 

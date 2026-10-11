@@ -81,7 +81,15 @@ The **main window** contains:
   windows are excluded from capture.
 - **Scene**:
   - Screen.
-  - Screen + Cam: the webcam in a corner, rounded, circle or rectangle.
+  - Screen + Cam: the webcam as an overlay. **Drag it in the preview** to place it anywhere;
+    released near a corner, it snaps there and stays in that corner when you resize it.
+    Shape: circle, rounded rectangle, square, pill or squircle, with a roundness slider for
+    the rounded, square and squircle shapes. Size, border (width and color), drop shadow and
+    mirroring are in the sidebar and the settings window.
+  - All overlay changes apply live, including while recording. They are baked into the
+    recorded video by the CoreImage compositor, so there is no extra encode. The shape mask,
+    border and shadow are rendered once per size and style; moving the overlay only changes a
+    transform.
   - Camera: the webcam full frame.
 
   While recording you can switch scenes live, provided the recording started with a camera
@@ -103,7 +111,8 @@ The **settings window** (⌘, or the Settings… button) covers:
 - Frame rate, codec (auto, H.264, HEVC, ProRes) and bitrate.
 - Cursor and click highlighting.
 - Audio devices, track layout and gains.
-- Camera device, plus overlay corner, shape, size and mirroring.
+- Camera device, plus the overlay: shape, roundness, size, border, shadow, corner presets and
+  mirroring.
 
 Settings persist in `~/Library/Application Support/rec-rs/settings.json`.
 
@@ -160,7 +169,9 @@ frames, and pauses don't count.
 | `--mic DEVICE` / `--no-mic` | `default` | Unique ID or name substring. |
 | `-w, --cam, --webcam [DEVICE]` | off | `default` or ID or name. Turns on the Screen + Cam scene. |
 | `--scene` | `screen-cam` with a camera, else `screen` | `screen`, `screen-cam`, `cam`. |
-| `--pip-size`, `--pip-corner`, `--pip-shape`, `--no-mirror` | `0.22`, bottom-right, rounded | Shape: `rounded`, `circle`, `rect`. |
+| `--pip-size`, `--pip-corner`, `--pip-shape`, `--no-mirror` | `0.22`, bottom-right, rounded | Shape: `circle`, `rounded`, `square`, `pill`, `squircle` (or `rect`). |
+| `--pip-pos X,Y` | | Center the overlay anywhere, as fractions of the frame from the top-left (overrides `--pip-corner`). |
+| `--pip-roundness`, `--pip-border`, `--pip-border-color`, `--pip-shadow` | `0.2`, `0`, `ffffff`, off | Roundness 0–1; border width in pixels at 1080p; hex color; soft drop shadow. |
 | `--audio-tracks` | `both` | `both` = mix plus system and mic stems; `mix`; `stems`. |
 | `--system-gain`, `--mic-gain` | `0` | dB, in the mix track. |
 | `--system-audio-offset-ms`, `--mic-offset-ms` | output latency, `0` | Sync offsets. System audio is shifted by the output device's latency by default (see Output format). |
@@ -220,7 +231,7 @@ Other commands:
 | Multiple displays/sources at once | ✅ | ❌ one screen source plus the webcam |
 | System audio | ✅ | ✅ |
 | Microphone | ✅ | ✅ |
-| Webcam overlay | ✅ any layout | ✅ corner PiP: rounded, circle or rect, mirrored |
+| Webcam overlay | ✅ any layout | ✅ drag anywhere with corner snapping; circle, rounded, square, pill or squircle; roundness, border, shadow, mirror; live while recording |
 | Separate audio tracks | ✅ up to 6 | ✅ mix plus system and mic stems |
 | Per-source gain | ✅ | ✅ |
 | Audio filters (noise suppression, compressor) | ✅ | ❌ |
