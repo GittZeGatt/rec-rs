@@ -25,6 +25,14 @@ define_class!(
         fn toggle_pause(&self, _s: Option<&AnyObject>) {
             super::push(Cmd::TogglePause);
         }
+        #[unsafe(method(saveReplay:))]
+        fn save_replay(&self, _s: Option<&AnyObject>) {
+            super::push(Cmd::SaveReplay);
+        }
+        #[unsafe(method(toggleStream:))]
+        fn toggle_stream(&self, _s: Option<&AnyObject>) {
+            super::push(Cmd::ToggleStream);
+        }
         #[unsafe(method(showWindow:))]
         fn show_window(&self, _s: Option<&AnyObject>) {
             super::push(Cmd::ShowWindow);
@@ -59,9 +67,11 @@ pub struct MenuBar {
     record: Retained<NSMenuItem>,
     pause: Retained<NSMenuItem>,
     reveal: Retained<NSMenuItem>,
+    replay: Retained<NSMenuItem>,
+    stream: Retained<NSMenuItem>,
     hotkey: Retained<NSMenuItem>,
     _target: Retained<Target>,
-    last: Option<(bool, bool, bool, String)>,
+    last: Option<(bool, bool, bool, String, bool, bool)>,
 }
 
 /// What the menu bar shows.
@@ -71,6 +81,10 @@ pub struct View<'a> {
     pub finishing: bool,
     pub clock: &'a str,
     pub has_last: bool,
+    /// The replay buffer is on.
+    pub replay: bool,
+    /// A stream is running.
+    pub live: bool,
 }
 
 impl MenuBar {
@@ -93,6 +107,11 @@ impl MenuBar {
         menu.addItem(&record);
         let pause = item("Pause", Some(sel!(togglePause:)), "");
         menu.addItem(&pause);
+        let replay = item("Save Replay", Some(sel!(saveReplay:)), "s");
+        replay.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+        menu.addItem(&replay);
+        let stream = item("Go Live", Some(sel!(toggleStream:)), "");
+        menu.addItem(&stream);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&item("Show Rec Window", Some(sel!(showWindow:)), ""));
         menu.addItem(&item("Settings…", Some(sel!(showSettings:)), ","));
@@ -106,8 +125,8 @@ impl MenuBar {
         menu.addItem(&hotkey);
         menu.addItem(&item("Quit Rec", Some(sel!(quit:)), "q"));
         status.setMenu(Some(&menu));
-        let mut mb = MenuBar { status, record, pause, reveal, hotkey, _target: target, last: None };
-        mb.update(&View { recording: false, paused: false, finishing: false, clock: "", has_last: false });
+        let mut mb = MenuBar { status, record, pause, reveal, replay, stream, hotkey, _target: target, last: None };
+        mb.update(&View { recording: false, paused: false, finishing: false, clock: "", has_last: false, replay: false, live: false });
         mb
     }
 
@@ -130,7 +149,7 @@ impl MenuBar {
     }
 
     pub fn update(&mut self, v: &View) {
-        let key = (v.recording, v.paused, v.finishing, v.clock.to_string());
+        let key = (v.recording, v.paused, v.finishing, v.clock.to_string(), v.replay, v.live);
         if self.last.as_ref() == Some(&key) {
             return;
         }
@@ -146,6 +165,8 @@ impl MenuBar {
         self.pause.setTitle(&ns(if v.paused { "Resume" } else { "Pause" }));
         self.pause.setEnabled(v.recording);
         self.reveal.setEnabled(v.has_last);
+        self.replay.setEnabled(v.replay);
+        self.stream.setTitle(&ns(if v.live { "Stop Streaming" } else { "Go Live" }));
         let Some(mtm) = MainThreadMarker::new() else { return };
         let Some(button) = self.status.button(mtm) else { return };
         let (symbol, title, red) = if v.finishing {
@@ -154,6 +175,8 @@ impl MenuBar {
             ("pause.circle.fill", format!(" {}", v.clock), false)
         } else if v.recording {
             ("record.circle.fill", format!(" {}", v.clock), true)
+        } else if v.live {
+            ("dot.radiowaves.left.and.right", " LIVE".to_string(), true)
         } else {
             ("record.circle", String::new(), false)
         };

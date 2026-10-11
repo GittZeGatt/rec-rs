@@ -76,6 +76,17 @@ pub fn main_window(ui: &mut Ui, st: &mut State) {
                 } else if st.preview.is_some() {
                     pill(ui, "PREVIEW", p.control, p.secondary);
                 }
+                if st.stream_status.as_ref().is_some_and(|s| s.live) {
+                    ui.add_space(4.0);
+                    pill(ui, "LIVE", RED, Color32::WHITE);
+                }
+                if let Some((text, at)) = &st.notice {
+                    if at.elapsed().as_secs_f32() < 4.0 {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(text).size(SECONDARY).color(p.secondary));
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Settings…").on_hover_text("Output, codec, resolution, audio (⌘,)").clicked() {
                         st.cmds.push(Cmd::ShowSettings);
@@ -495,9 +506,99 @@ fn sources(ui: &mut Ui, st: &mut State) {
     );
     ui.label(RichText::new(tilde(&s.output_dir)).size(SECONDARY).color(theme::pal(ui).secondary));
 
+    live_controls(ui, st, &mut s);
+
     if s != st.settings {
         st.settings = s;
         let _ = st.settings.save();
+    }
+}
+
+fn bytes_text(b: usize) -> String {
+    if b >= 1 << 30 { format!("{:.1} GB", b as f64 / (1u64 << 30) as f64) } else { format!("{:.0} MB", b as f64 / (1u64 << 20) as f64) }
+}
+
+pub const STREAM_DESTS: [(&str, &str); 3] = [("youtube", "YouTube"), ("twitch", "Twitch"), ("custom", "Custom (RTMP or WHIP URL)")];
+
+/// Replay buffer and streaming: both use the shared live encode and run
+/// with or without a recording.
+fn live_controls(ui: &mut Ui, st: &mut State, s: &mut Settings) {
+    let p = theme::pal(ui);
+    section(ui, "REPLAY BUFFER");
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut s.replay_enabled, "Keep the last");
+        ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(60.0);
+        ui.add(egui::Slider::new(&mut s.replay_secs, 15..=300).suffix(" s").step_by(5.0));
+    });
+    if let Some((held, bytes)) = st.replay_stats {
+        ui.horizontal(|ui| {
+            let tip = match st.replay_hotkey {
+                Some(true) => "Save the buffer to an MP4 without stopping (⇧⌘S)",
+                _ => "Save the buffer to an MP4 without stopping (⇧⌘S unavailable)",
+            };
+            if ui.add_enabled(held > 0.0, egui::Button::new("Save Replay")).on_hover_text(tip).clicked() {
+                st.cmds.push(Cmd::SaveReplay);
+            }
+            ui.label(RichText::new(format!("{held:.0} s · {} in memory", bytes_text(bytes))).size(SECONDARY).color(p.secondary));
+        });
+    }
+
+    section(ui, "STREAM");
+    let live = st.stream_id.is_some();
+    let dests: Vec<(String, String)> = STREAM_DESTS.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
+    combo(ui, "stream-dest", &mut s.stream_dest, &dests, !live);
+    if s.stream_dest == "custom" {
+        ui.add_space(4.0);
+        ui.add_enabled(
+            !live,
+            egui::TextEdit::singleline(&mut s.stream_custom_url)
+                .hint_text("rtmp://… or https://…/whip")
+                .desired_width(f32::INFINITY),
+        );
+    }
+    // The key goes to the Keychain (per destination URL), never to settings.
+    let url = s.stream_url();
+    let has_key = if url == st.settings.stream_url() { st.has_stream_key() } else { false };
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if has_key && st.stream_key_input.is_empty() {
+            ui.label(RichText::new("Stream key saved in Keychain").size(SECONDARY).color(p.secondary));
+            if ui.add_enabled(!live, egui::Button::new("Remove")).clicked() {
+                st.delete_stream_key();
+            }
+        } else {
+            let w = ui.available_width() - 50.0;
+            ui.add_sized(
+                vec2(w, 22.0),
+                egui::TextEdit::singleline(&mut st.stream_key_input).password(true).hint_text("Stream key"),
+            );
+            if ui.add_enabled(!st.stream_key_input.trim().is_empty(), egui::Button::new("Save")).clicked() {
+                st.save_stream_key();
+            }
+        }
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let whip = url.starts_with("http");
+        let ready = !url.is_empty() && (has_key || whip);
+        let label = if live { "Stop Stream" } else { "Go Live" };
+        let b = egui::Button::new(RichText::new(label).color(if live { Color32::WHITE } else { p.text })).fill(if live { RED } else { p.control });
+        let resp = ui.add_enabled(live || ready, b);
+        let resp = if ready || live { resp } else { resp.on_disabled_hover_text("Save a stream key first") };
+        if resp.clicked() {
+            st.cmds.push(Cmd::ToggleStream);
+        }
+        if let Some(status) = &st.stream_status {
+            let text = if status.live {
+                format!("{}  {:.1} Mb/s  {} dropped", crate::record::clock(status.duration), status.bitrate / 1e6, status.dropped_frames)
+            } else {
+                status.state.clone()
+            };
+            ui.label(RichText::new(text).size(SECONDARY).color(if status.live { p.text } else { p.secondary }));
+        }
+    });
+    if let Some(e) = st.stream_status.as_ref().and_then(|s| (!s.live).then_some(s.error.as_ref()).flatten()) {
+        ui.label(RichText::new(e).size(SECONDARY).color(RED));
     }
 }
 
@@ -623,6 +724,34 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         ui.add(egui::Slider::new(&mut s.mic_gain_db, -24.0..=24.0).suffix(" dB").step_by(0.5));
         ui.end_row();
     });
+
+    section(ui, "LIVE ENCODE (REPLAY & STREAMING)");
+    let streaming = st.stream_id.is_some();
+    ui.add_enabled_ui(!streaming, |ui| {
+        grid(ui, "live", &mut |ui| {
+            ui.label("Resolution");
+            let opts: Vec<(String, String)> =
+                [("720p", "720p"), ("1080p", "1080p"), ("1440p", "1440p"), ("4k", "4K")].iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
+            combo(ui, "live-res", &mut s.live_resolution, &opts, true);
+            ui.end_row();
+            ui.label("Video bitrate");
+            ui.add(egui::Slider::new(&mut s.stream_bitrate_kbps, 1000..=20_000).suffix(" kb/s").step_by(500.0));
+            ui.end_row();
+            ui.label("Rate control");
+            ui.checkbox(&mut s.stream_cbr, "Constant bitrate (CBR)");
+            ui.end_row();
+            ui.label("Keyframe every");
+            ui.add(egui::Slider::new(&mut s.keyframe_secs, 1.0..=4.0).suffix(" s").step_by(0.5));
+            ui.end_row();
+            ui.label("Audio bitrate");
+            let opts: Vec<(u32, String)> = [96, 128, 160, 192, 256, 320].iter().map(|k| (*k, format!("{k} kb/s"))).collect();
+            combo(ui, "live-audio", &mut s.stream_audio_kbps, &opts, true);
+            ui.end_row();
+        });
+    });
+    if streaming {
+        ui.label(RichText::new("Stop the stream to change the live encode.").size(SECONDARY).color(theme::pal(ui).secondary));
+    }
 
     section(ui, "CAMERA");
     grid(ui, "cam", &mut |ui| {

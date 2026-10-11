@@ -48,6 +48,19 @@ pub struct Settings {
     pub mirror: bool,
     pub cursor: bool,
     pub clicks: bool,
+    /// Keep the last `replay_secs` of the live encode in memory.
+    pub replay_enabled: bool,
+    pub replay_secs: u32,
+    /// "youtube", "twitch", or an rtmp(s):// or WHIP http(s):// URL. The
+    /// stream key lives in the Keychain, never here.
+    pub stream_dest: String,
+    pub stream_custom_url: String,
+    /// Live encode (replay buffer and streams).
+    pub live_resolution: String,
+    pub stream_bitrate_kbps: u32,
+    pub keyframe_secs: f64,
+    pub stream_cbr: bool,
+    pub stream_audio_kbps: u32,
     /// Window to record (ID from `rec-rs devices`); not persisted because
     /// window IDs change between launches.
     #[serde(skip)]
@@ -82,6 +95,15 @@ impl Default for Settings {
             mirror: true,
             cursor: true,
             clicks: false,
+            replay_enabled: false,
+            replay_secs: 60,
+            stream_dest: "youtube".into(),
+            stream_custom_url: String::new(),
+            live_resolution: "1080p".into(),
+            stream_bitrate_kbps: 6000,
+            keyframe_secs: 2.0,
+            stream_cbr: true,
+            stream_audio_kbps: 160,
             window: None,
         }
     }
@@ -164,7 +186,44 @@ impl Settings {
             pip_border_color: d.pip_border_color,
             pip_shadow: d.pip_shadow,
             mirror: d.mirror,
+            replay_enabled: d.replay_enabled,
+            replay_secs: d.replay_secs,
+            stream_dest: d.stream_dest.clone(),
+            stream_custom_url: d.stream_custom_url.clone(),
+            live_resolution: d.live_resolution.clone(),
+            stream_bitrate_kbps: d.stream_bitrate_kbps,
+            keyframe_secs: d.keyframe_secs,
+            stream_cbr: d.stream_cbr,
+            stream_audio_kbps: d.stream_audio_kbps,
             ..self.clone()
+        }
+    }
+
+    /// The stream destination URL (the YouTube and Twitch ingest URLs for
+    /// those choices).
+    pub fn stream_url(&self) -> String {
+        match self.stream_dest.as_str() {
+            "custom" => self.stream_custom_url.trim().to_string(),
+            d => crate::live::destination_url(d),
+        }
+    }
+
+    /// The live encode these settings describe (sizes above the capture
+    /// are clamped to it by the encoder).
+    pub fn live_config(&self) -> crate::live::LiveConfig {
+        let (width, height) = match self.live_resolution.as_str() {
+            "720p" => (1280, 720),
+            "1440p" => (2560, 1440),
+            "4k" => (3840, 2160),
+            _ => (1920, 1080),
+        };
+        crate::live::LiveConfig {
+            width,
+            height,
+            bitrate: self.stream_bitrate_kbps.clamp(500, 50_000) as u64 * 1000,
+            keyframe_secs: self.keyframe_secs.clamp(0.5, 4.0),
+            cbr: self.stream_cbr,
+            audio_bitrate: self.stream_audio_kbps.clamp(64, 320) * 1000,
         }
     }
 
