@@ -8,7 +8,8 @@ use objc2_core_video::CVPixelBuffer;
 
 use crate::util::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Corner {
     BottomRight,
     BottomLeft,
@@ -16,7 +17,8 @@ pub enum Corner {
     TopLeft,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Shape {
     /// Rounded rectangle, camera aspect ratio.
     Rounded,
@@ -27,7 +29,8 @@ pub enum Shape {
 }
 
 /// What the output frame shows. Switchable live while the webcam runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Scene {
     /// The screen only.
     Screen,

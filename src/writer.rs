@@ -30,7 +30,8 @@ use crate::util::*;
 
 pub const TIMESCALE: i32 = 60000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Codec {
     H264,
     Hevc,
@@ -50,7 +51,8 @@ pub struct VideoSpec {
 }
 
 /// Audio track layout when both system audio and mic are recorded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum AudioLayout {
     /// Track 1 = system+mic mix (what players use), tracks 2-3 = system and mic
     /// stems for editors. QuickTime plays only the mix.
@@ -169,6 +171,7 @@ impl Pauses {
     }
 
     /// Total paused slots (closed spans only).
+    #[cfg(test)]
     pub fn total(&self) -> i64 {
         self.spans.iter().filter_map(|&(p, r)| r.map(|r| r - p)).sum()
     }
@@ -363,10 +366,6 @@ impl Sink {
         }
         self.scene = scene;
         true
-    }
-
-    pub fn scene(&self) -> Scene {
-        self.scene
     }
 
     /// Pause at host time `now`: nothing captured from the next frame slot on

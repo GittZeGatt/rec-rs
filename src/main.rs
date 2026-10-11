@@ -1,11 +1,12 @@
+mod app;
 mod camera;
 mod compose;
-mod gui;
 mod hotkey;
 mod mixer;
 mod probe;
 mod record;
 mod screen;
+mod settings;
 mod synth;
 mod tcc;
 mod util;
@@ -31,12 +32,15 @@ struct Cli {
 enum Cmd {
     /// Record the screen (plus system audio, mic, and optional webcam overlay).
     Record(RecordArgs),
-    /// Menu bar app with live preview and a global Cmd+Shift+R hotkey
-    /// (also what `open dist/Rec.app` starts).
+    /// The app: window with live preview and sources, settings, menu bar
+    /// item and a global Cmd+Shift+R hotkey (what `open dist/Rec.app` starts).
     Gui {
         /// Start recording immediately (e.g. from a Login Item or script).
         #[arg(long)]
         start_recording: bool,
+        /// Open the settings window at launch.
+        #[arg(long)]
+        settings: bool,
     },
     /// List displays, windows, cameras and microphones.
     Devices,
@@ -372,8 +376,8 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     tcc::disclaim_and_reexec();
     let cli = Cli::parse();
-    let r = match cli.cmd.unwrap_or(Cmd::Gui { start_recording: false }) {
-        Cmd::Gui { start_recording } => gui::run(start_recording),
+    let r = match cli.cmd.unwrap_or(Cmd::Gui { start_recording: false, settings: false }) {
+        Cmd::Gui { start_recording, settings } => app::run(start_recording, settings),
         Cmd::Record(a) => record(a),
         Cmd::Devices => devices(),
         Cmd::Stop => record::stop_running(),
