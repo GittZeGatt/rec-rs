@@ -132,6 +132,10 @@ pub struct State {
     /// UI requests handled after the frame.
     pub cmds: Vec<Cmd>,
     pub refresh_devices: bool,
+    /// Overlay last sent to the running session.
+    pip_applied: Option<crate::compose::PipSpec>,
+    /// Camera aspect ratio from the running session (for drag hit-testing).
+    pub cam_aspect: f64,
     pub permissions_missing: bool,
 }
 
@@ -143,6 +147,23 @@ impl State {
     /// Recorded time (excluding pauses) of the running recording.
     pub fn clock(&self) -> String {
         self.recording.as_ref().map(|s| record::clock(s.recorded_secs())).unwrap_or_default()
+    }
+
+    /// Send the overlay settings to the running session if they changed:
+    /// moving or restyling the camera is live in the preview and the file.
+    pub fn apply_pip(&mut self) {
+        let Some(sess) = self.recording.as_ref().or(self.preview.as_ref()) else {
+            self.pip_applied = None;
+            return;
+        };
+        if let Some(a) = sess.cam_aspect() {
+            self.cam_aspect = a;
+        }
+        let spec = self.settings.pip_spec();
+        if self.pip_applied.as_ref() != Some(&spec) {
+            sess.set_pip(spec.clone());
+            self.pip_applied = Some(spec);
+        }
     }
 
     /// Whether the running session can switch to `scene` live.
@@ -214,6 +235,8 @@ impl App {
             cmds: vec![],
             refresh_devices: false,
             permissions_missing: false,
+            pip_applied: None,
+            cam_aspect: 16.0 / 9.0,
         };
         load_devices(&mut st);
         App {
@@ -364,7 +387,8 @@ impl App {
     /// recording; restart it when the settings change.
     fn sync_preview(&mut self) {
         let want = self.main_visible && self.st.recording.is_none() && !self.st.finishing;
-        let stale = self.st.preview_settings.as_ref() != Some(&self.st.settings);
+        // Overlay changes are applied live (`apply_pip`), not by restarting.
+        let stale = self.st.preview_settings.as_ref().map(Settings::capture_key) != Some(self.st.settings.capture_key());
         if self.st.preview.is_some() && (!want || stale) {
             if let Some(s) = self.st.preview.take() {
                 let _ = s.finish();
@@ -375,6 +399,7 @@ impl App {
             let cb = preview::callback(Arc::new(wake));
             match self.options(None).and_then(|(o, t)| Session::start(&o, t, false, Some(cb))) {
                 Ok(s) => {
+                    self.st.pip_applied = Some(self.st.settings.pip_spec());
                     self.st.preview = Some(s);
                     self.st.permissions_missing = false;
                 }
@@ -415,6 +440,7 @@ impl App {
         match r {
             Ok(sess) => {
                 let _ = std::fs::write(record::pidfile_path(), format!("{}\n{}\n", std::process::id(), file.display()));
+                self.st.pip_applied = Some(self.st.settings.pip_spec());
                 self.st.recording = Some(sess);
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
@@ -547,6 +573,7 @@ impl App {
             m.feed(l, dt);
         }
         self.sync_preview();
+        self.st.apply_pip();
         let clock = self.st.clock();
         let view = menubar::View {
             recording: self.st.recording.is_some(),
@@ -767,6 +794,8 @@ impl ApplicationHandler for App {
 struct SelfTest {
     t0: Option<Instant>,
     step: u32,
+    /// Start time of the preview session before an overlay change.
+    session_before: Option<Instant>,
 }
 
 impl SelfTest {
@@ -822,7 +851,20 @@ impl SelfTest {
                 push(Cmd::ShowSettings);
                 self.step = 5;
             }
-            5 if t > 10.0 => {
+            5 if t > 9.0 && app.st.preview.is_some() => {
+                // Move and restyle the overlay: must apply live, not restart.
+                self.session_before = app.st.preview.as_ref().map(|s| s.started);
+                app.st.settings.pip_place = crate::compose::Place::At([0.3, 0.4]);
+                app.st.settings.pip_shape = crate::compose::Shape::Squircle;
+                self.step = 6;
+            }
+            6 if t > 10.0 => {
+                let now = app.st.preview.as_ref().map(|s| s.started);
+                println!(
+                    "selftest: overlay change live={} applied={}",
+                    now.is_some() && now == self.session_before,
+                    app.st.pip_applied.as_ref() == Some(&app.st.settings.pip_spec())
+                );
                 println!(
                     "selftest: settings window={} preview_restarted={}",
                     app.settings_win.is_some(),
@@ -831,7 +873,7 @@ impl SelfTest {
                 app.hide_main();
                 println!("selftest: after close preview_session={}", app.st.preview.is_some());
                 push(Cmd::Quit);
-                self.step = 6;
+                self.step = 7;
             }
             _ => {}
         }

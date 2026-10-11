@@ -6,7 +6,8 @@ use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke
 
 use super::theme::{self, BODY, SECONDARY, TOOLBAR_H, TRAFFIC_LIGHTS_W};
 use super::{Cmd, Meter, State};
-use crate::compose::{Corner, Scene, Shape};
+use crate::compose::{self, Corner, Place, Scene, Shape};
+use crate::settings::Settings;
 use crate::settings::{FPS, RESOLUTIONS};
 use crate::writer::{AudioLayout, Codec};
 
@@ -145,7 +146,168 @@ fn preview(ui: &mut Ui, st: &mut State) {
             let border = if st.is_paused() { Color32::from_rgb(0xff, 0x95, 0x00) } else { RED };
             ui.painter().rect_stroke(rect, r, Stroke::new(2.0, border), egui::StrokeKind::Inside);
         }
+        if live && st.settings.scene == Scene::ScreenCam {
+            drag_overlay(ui, st, rect);
+        }
     });
+}
+
+/// Output-pixel frame the overlay geometry is computed in (any size with
+/// the preview's aspect ratio; positions are fractions of it).
+fn frame_size(st: &State) -> (f64, f64) {
+    (3840.0, (3840.0 / st.preview_aspect.max(0.1) as f64).round())
+}
+
+fn overlay_ui_rect(st: &State, spec: &compose::PipSpec, preview: egui::Rect) -> egui::Rect {
+    let (w, h) = frame_size(st);
+    let [x, y, ow, oh] = compose::overlay_rect(spec, w, h, st.cam_aspect);
+    let (sx, sy) = (preview.width() as f64 / w, preview.height() as f64 / h);
+    egui::Rect::from_min_size(
+        preview.min + vec2((x * sx) as f32, (y * sy) as f32),
+        vec2((ow * sx) as f32, (oh * sy) as f32),
+    )
+}
+
+/// Drag the camera overlay in the preview. It moves live (in the preview
+/// and the recording) and snaps to a corner when released near one.
+fn drag_overlay(ui: &mut Ui, st: &mut State, preview: egui::Rect) {
+    const SNAP: f64 = 0.05;
+    let spec = st.settings.pip_spec();
+    let ov = overlay_ui_rect(st, &spec, preview);
+    let resp = ui.interact(ov, ui.id().with("pip-drag"), Sense::drag());
+    let accent = theme::accent();
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        ui.painter().rect_stroke(ov, CornerRadius::same(4), Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+    }
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        let (cx, cy) = ((ov.center().x - preview.min.x) / preview.width(), (ov.center().y - preview.min.y) / preview.height());
+        let at = [(cx + d.x / preview.width()).clamp(0.0, 1.0) as f64, (cy + d.y / preview.height()).clamp(0.0, 1.0) as f64];
+        st.settings.pip_place = Place::At(at);
+        // Show where it would snap.
+        let (w, h) = frame_size(st);
+        if let Some(c) = compose::snap_corner(&st.settings.pip_spec(), w, h, st.cam_aspect, SNAP) {
+            let ghost = overlay_ui_rect(st, &compose::PipSpec { place: Place::Corner(c), ..st.settings.pip_spec() }, preview);
+            ui.painter().rect_stroke(ghost, CornerRadius::same(4), Stroke::new(1.0, accent.gamma_multiply(0.7)), egui::StrokeKind::Outside);
+        }
+        st.apply_pip();
+    }
+    if resp.drag_stopped() {
+        let (w, h) = frame_size(st);
+        if let Some(c) = compose::snap_corner(&st.settings.pip_spec(), w, h, st.cam_aspect, SNAP) {
+            st.settings.pip_place = Place::Corner(c);
+        }
+        st.apply_pip();
+        let _ = st.settings.save();
+    }
+}
+
+/// A small icon of `shape` (with the current roundness).
+fn shape_icon(ui: &Ui, rect: egui::Rect, shape: Shape, roundness: f64, color: Color32) {
+    let c = rect.center();
+    let (w, h) = if shape.is_square() { (16.0, 16.0) } else { (22.0, 13.0) };
+    let r = egui::Rect::from_center_size(c, vec2(w, h));
+    let painter = ui.painter();
+    let stroke = Stroke::new(1.5, color);
+    match shape {
+        Shape::Circle => {
+            painter.circle_stroke(c, 8.0, stroke);
+        }
+        Shape::Squircle => {
+            let n = compose::squircle_exponent(roundness);
+            let pts: Vec<egui::Pos2> = (0..64)
+                .map(|i| {
+                    let t = i as f64 / 64.0 * std::f64::consts::TAU;
+                    let (ct, s) = (t.cos(), t.sin());
+                    let x = ct.signum() * ct.abs().powf(2.0 / n) * 8.0;
+                    let y = s.signum() * s.abs().powf(2.0 / n) * 8.0;
+                    c + vec2(x as f32, y as f32)
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(pts, stroke));
+        }
+        _ => {
+            let rad = match shape {
+                Shape::Pill => h / 2.0,
+                Shape::Rect => 0.0,
+                _ => roundness as f32 * h / 2.0,
+            };
+            painter.rect_stroke(r, CornerRadius::same(rad.round() as u8), stroke, egui::StrokeKind::Middle);
+        }
+    }
+}
+
+/// Camera overlay look and position. Live: also while recording.
+fn overlay_controls(ui: &mut Ui, s: &mut Settings) {
+    let p = theme::pal(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let bw = ((ui.available_width() - 16.0) / 5.0).max(30.0);
+        for shape in Shape::PICKER {
+            let sel = s.pip_shape == shape;
+            let (rect, resp) = ui.allocate_exact_size(vec2(bw, 30.0), Sense::click());
+            let fill = if sel { theme::accent() } else if resp.hovered() { p.hover } else { p.control };
+            ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+            shape_icon(ui, rect, shape, s.pip_roundness, if sel { Color32::WHITE } else { p.text });
+            if resp.on_hover_text(shape.label()).clicked() {
+                s.pip_shape = shape;
+            }
+        }
+    });
+    ui.add_space(4.0);
+    // Label (64) + slider + value box (about 52) + spacing must fit.
+    let slider_w = (ui.available_width() - 64.0 - 60.0 - 40.0).max(60.0);
+    let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui)| {
+        ui.horizontal(|ui| {
+            ui.add_sized(vec2(64.0, 18.0), egui::Label::new(RichText::new(label).size(SECONDARY).color(p.secondary)));
+            add(ui);
+        });
+    };
+    ui.spacing_mut().slider_width = slider_w;
+    row(ui, "Size", &mut |ui| {
+        let mut pct = s.pip_size * 100.0;
+        if ui.add(egui::Slider::new(&mut pct, 10.0..=50.0).suffix(" %").integer()).changed() {
+            s.pip_size = pct / 100.0;
+        }
+    });
+    row(ui, "Roundness", &mut |ui| {
+        let mut pct = s.pip_roundness * 100.0;
+        if ui.add_enabled(s.pip_shape.uses_roundness(), egui::Slider::new(&mut pct, 0.0..=100.0).suffix(" %").integer()).changed() {
+            s.pip_roundness = pct / 100.0;
+        }
+    });
+    row(ui, "Border", &mut |ui| {
+        // Narrower slider: the color swatch shares the row.
+        ui.spacing_mut().slider_width = slider_w - 30.0;
+        ui.add(egui::Slider::new(&mut s.pip_border, 0.0..=20.0).suffix(" px").integer());
+        ui.add_enabled_ui(s.pip_border > 0.0, |ui| {
+            ui.spacing_mut().interact_size = vec2(22.0, 18.0);
+            ui.color_edit_button_srgb(&mut s.pip_border_color);
+        });
+    });
+    row(ui, "Position", &mut |ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for (c, label, tip) in [
+            (Corner::TopLeft, "↖", "Top left"),
+            (Corner::TopRight, "↗", "Top right"),
+            (Corner::BottomLeft, "↙", "Bottom left"),
+            (Corner::BottomRight, "↘", "Bottom right"),
+        ] {
+            let sel = s.pip_place == Place::Corner(c);
+            if ui.add(egui::Button::selectable(sel, label).min_size(vec2(26.0, 22.0))).on_hover_text(tip).clicked() {
+                s.pip_place = Place::Corner(c);
+            }
+        }
+        if matches!(s.pip_place, Place::At(_)) {
+            ui.label(RichText::new("custom").size(SECONDARY).color(p.secondary));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut s.pip_shadow, "Shadow");
+        ui.checkbox(&mut s.mirror, "Mirror");
+    });
+    ui.label(RichText::new("Drag the camera in the preview to move it; it snaps to corners.").size(SECONDARY).color(p.secondary));
 }
 
 fn controls(ui: &mut Ui, st: &mut State) {
@@ -304,6 +466,10 @@ fn sources(ui: &mut Ui, st: &mut State) {
     if !s.scene.uses_cam() {
         ui.label(RichText::new("Pick a camera scene to use the webcam.").size(SECONDARY).color(theme::pal(ui).secondary));
     }
+    if s.scene == Scene::ScreenCam {
+        section(ui, "CAMERA OVERLAY");
+        overlay_controls(ui, &mut s);
+    }
 
     section(ui, "AUDIO");
     ui.add_enabled(idle, egui::Checkbox::new(&mut s.system_audio, "System audio"));
@@ -346,6 +512,15 @@ pub fn settings_window(ui: &mut Ui, st: &mut State) {
             }
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.add_enabled_ui(idle, |ui| settings_form(ui, st));
+                // The overlay stays editable while recording (applied live).
+                section(ui, "CAMERA OVERLAY");
+                let mut s = st.settings.clone();
+                overlay_controls(ui, &mut s);
+                if s != st.settings {
+                    st.settings = s;
+                    st.apply_pip();
+                    let _ = st.settings.save();
+                }
             });
         });
 }
@@ -447,32 +622,6 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         let mut cams: Vec<(Option<String>, String)> = vec![(None, "Default camera".into())];
         cams.extend(st.cameras.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
         combo(ui, "cam2", &mut s.camera, &cams, true);
-        ui.end_row();
-        ui.label("Overlay corner");
-        let opts = vec![
-            (Corner::BottomRight, "Bottom right".to_string()),
-            (Corner::BottomLeft, "Bottom left".to_string()),
-            (Corner::TopRight, "Top right".to_string()),
-            (Corner::TopLeft, "Top left".to_string()),
-        ];
-        combo(ui, "corner", &mut s.pip_corner, &opts, true);
-        ui.end_row();
-        ui.label("Overlay shape");
-        let opts = vec![
-            (Shape::Rounded, "Rounded".to_string()),
-            (Shape::Circle, "Circle".to_string()),
-            (Shape::Rect, "Rectangle".to_string()),
-        ];
-        combo(ui, "shape", &mut s.pip_shape, &opts, true);
-        ui.end_row();
-        ui.label("Overlay size");
-        let mut pct = s.pip_size * 100.0;
-        if ui.add(egui::Slider::new(&mut pct, 10.0..=50.0).suffix(" %").integer()).changed() {
-            s.pip_size = pct / 100.0;
-        }
-        ui.end_row();
-        ui.label("Mirror");
-        ui.checkbox(&mut s.mirror, "Mirror the camera");
         ui.end_row();
     });
     ui.add_space(12.0);

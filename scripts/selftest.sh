@@ -73,14 +73,16 @@ elif [ "${1:-}" != "--no-screen" ]; then
   check screen-mix.mp4    -t 2 --audio-tracks mix
   # App: scripted preview -> record (the hotkey's command) -> pause/resume
   # -> stop -> settings window -> hide window -> quit.
+  mkdir -p "$OUT/gui"; echo '{"scene": "screen-cam"}' >"$OUT/gui/settings.json"
   if REC_GUI_SELFTEST=1 REC_OUTPUT_DIR="$OUT/gui" REC_SETTINGS="$OUT/gui/settings.json" \
        "$REC" gui >"$OUT/gui.log" 2>&1 \
      && grep -q 'idle preview session=true frame_shown=true' "$OUT/gui.log" \
      && grep -q 'paused=true' "$OUT/gui.log" \
      && grep -q 'settings window=true' "$OUT/gui.log" \
+     && grep -q 'overlay change live=true applied=true' "$OUT/gui.log" \
      && f=$(sed -n 's/.*saved=Some("\(.*\)").*/\1/p' "$OUT/gui.log") && [ -n "$f" ] \
      && "$REC" probe "$f" >"$OUT/gui.probe" 2>&1; then
-    echo "PASS  gui-app  (preview, record, pause, saved and probed, settings window)"; pass=$((pass+1))
+    echo "PASS  gui-app  (preview, record, pause, saved and probed, settings window, live overlay change)"; pass=$((pass+1))
   else
     echo "FAIL  gui-app  (see $OUT/gui.log)"; fail=$((fail+1))
   fi
