@@ -24,7 +24,8 @@ display at 4112×2658 pixels. Builds are release builds of `rec-rs`.
 | Run | Setup | Frames | Dropped | Frame gaps | A/V end | CPU mean / max | Memory |
 |---|---|---|---|---|---|---|---|
 | Soak 1, 08:34–09:04 | 4K60 HEVC, screen + system audio + mic + webcam overlay, 3 audio tracks | 107,955 / 108,000 | **45**, all in one 5-s window (see below) | 16.667 ms except 8 gaps of 100–133 ms at 13:27 | all 3 tracks end within 0.1 ms of the video, at 1800.000 s | 34.4% / 45.0% | 64–78 MB steady (max 151 MB at start), no growth |
-| Soak 2 (after the fix), 09:29–09:59 | 4K60 HEVC, screen + system audio (mic and camera grants were reset; see PROGRESS) | *pending* | | | | | |
+| Soak 2 (after the fix), 09:29–09:59 | 4K60 HEVC, screen + system audio (the mic and camera grants had been reset; see PROGRESS) | **108,000 / 108,000** | **0** (0 encoder retries) | 16.667 ms everywhere (0 irregular) | 0.0 ms | 6.0% / 8.8% | 31–41 MB, no growth |
+| Soak 3 (after the fix), 10:17–10:47 | 4K60 HEVC, screen + system audio + mic + webcam overlay, 3 audio tracks | 106,623 / 108,000 | 1,377, almost all in one 21.7-s freeze at 10:44 (see below) | 16.667 ms except 7 gaps (366–417 ms at 10:24:43 and 10:24:56; 21.7 s at 10:44:18) | 0.0 ms | 25.4% / 39.8% | 27–63 MB, no growth |
 
 Both files played in AVFoundation (`playable: true`, every sample decoded) with no ffmpeg
 decode errors.
@@ -39,6 +40,21 @@ writer used to drop a frame slot the moment the encoder was busy.
 same timestamp, on the next pacer pass, about 8 ms later. A slot is dropped only once it is
 more than 0.5 s overdue, which only happens under sustained overload. With one 4K60 stream at
 worst-case content, the encoder was never busy: 0 retries and 0 drops (table below).
+
+**Soak 3 was disturbed by the machine, not the recorder.** At about 10:44 the MacBook's lid
+was closed with two 5K displays attached (clamshell mode; `AppleClamshellState = Yes`).
+
+- **Display reconfiguration.** macOS reconfigured the displays, so ScreenCaptureKit delivered
+  no frames for 21.7 s. The recorder's CPU fell to 0% for those samples. The writer held the
+  last frame and resumed on the exact grid; the file stayed playable and the audio was
+  untouched (all tracks end at 1800.000 s).
+- **Camera.** The built-in camera is unavailable with the lid closed, so the overlay delivered
+  0 camera frames after that point.
+- **Earlier hiccups.** The two shorter gaps at 10:24 coincide with a system NFC/Bluetooth stack
+  load (`nfcd` power assertions).
+
+Soak 1, whose only stall was the encoder's (now handled), and soak 2, a clean 108,000 of
+108,000, are the representative runs. A clean webcam soak needs the lid open.
 
 ## Single-run measurements (60 s each, after the fix)
 
@@ -82,6 +98,12 @@ In both cases the files stayed valid and correctly timed:
 Under overload, frames are dropped at the 0.5 s limit rather than letting latency and memory
 grow without bound.
 
+## Crash safety
+
+`kill -9` of a 4K60 recording at about 8.5 s left a file that AVFoundation plays and decodes
+completely: 8.000 s of video and audio, everything up to the last 2 s fragment. ffmpeg also
+decoded it with no errors.
+
 ## A/V sync
 
 | Test | Result |
@@ -90,6 +112,21 @@ grow without bound.
 | Sync across two pauses | 0.0 ms |
 | Every 50th audio buffer dropped (a simulated glitching device) | 0.0 ms. The 20 gaps were filled with silence, so audio stays on the capture clock. |
 | Soak 1, 30 min, real devices | All audio tracks end within 0.1 ms of the 1800.000 s video, so there is no drift |
+| End to end through the real capture path: AVPlayer plays a flash/beep clip, rec-rs records its window and system audio | Before the output-latency fix: audio early by 25.0, 15.9 and 16.7 ms (mean about -19 ms). After: +4.0, -0.9, -10.4 and -16.0 ms (mean about -6 ms). |
+
+**Reading the end-to-end numbers.** Flash detection is quantized to the 60 fps capture grid,
+and AVPlayer's frame presentation shifts by up to a frame from run to run. Single runs therefore
+vary by about ±15 ms, so compare means. All results are inside the roughly 40 ms threshold where
+audio leading video becomes noticeable. With ffplay as the player instead of AVPlayer, audio
+came out 64–81 ms late; ffplay's own A/V sync is looser, so AVPlayer is the reference.
+
+**Output-latency fix** (commit `f56977a`). ScreenCaptureKit captures system audio when it is
+mixed. It is heard one output latency later, and players schedule audio ahead by that amount so
+it matches the picture. rec-rs now shifts system audio later by the default output device's
+presentation latency, as reported by the CoreAudio HAL: 27.3 ms on the built-in speakers here.
+On Bluetooth headphones the latency is far larger, often 150 ms or more, and without the shift
+the recording would have audio that early. `--system-audio-offset-ms` and `--mic-offset-ms`
+override the shift. The latency is read once, when recording starts.
 
 **Bug found while measuring, now fixed** (commit `fa747f4`). AVAssetWriter lays audio buffers
 end to end and ignores gaps in their timestamps. A device buffer that arrived before the first

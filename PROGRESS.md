@@ -1,21 +1,6 @@
 # PROGRESS
 
-## ⚠️ Action needed: re-approve Microphone and Camera (2026-10-11 09:12)
-
-Between 08:35 and 09:10, macOS reset Rec's **Microphone** and **Camera** grants to "not yet
-requested". Screen Recording is still granted. The signing identity didn't change. The likely
-trigger is the bundle change from a menu bar-only app to a Dock app (`LSUIElement`), or the
-LaunchServices re-registration. I triggered the request once, at 09:12, and the prompts went
-unanswered. To re-approve, run:
-
-```sh
-dist/rec-rs permissions --request      # then click Allow for Microphone and Camera
-```
-
-Alternatively, open Rec and click **Request Permissions** in the error banner. Until then, mic
-and webcam recordings fail with "missing permission", and the self-test skips those cases.
-
-## Status (2026-10-11 ~09:35 EDT)
+## Status (2026-10-11 ~10:25 EDT)
 
 All 7 milestones of the goal are built and verified by automated tests on this MacBook Pro.
 `rec-rs` records 1080p60 or 4K60 screen + mic + system audio + webcam into a `.mov`/`.mp4` that
@@ -51,11 +36,15 @@ text (`~/.cache/rec_goal_full.txt`), read on 2026-10-11. Everything listed was r
 | 4 | MP4/MOV via AVAssetWriter, crash-safe, Final Cut/Premiere/DaVinci compatible | **Done; editor import is a manual check** | Fragments every 2 s; SIGKILL leaves a playable file. Output is CFR, BT.709, `hvc1`, standard AAC, which is what editors want. Not yet opened in Resolve by a person. |
 | 5 | Webcam PiP (corner, circle or rounded mask) composited on the GPU; scenes: full screen, screen + cam, cam only | **Done** | CoreImage on Metal. `--scene screen/screen-cam/cam`, switchable live in the app. |
 | 6 | Native UI in paper-rs style (transparent titlebar, Inter, egui) with menu bar icon: pick sources, live preview, start/stop with ⇧⌘R, pause/resume, timer, level meters, settings window; plus a headless CLI | **Done, except the physical ⇧⌘R keypress** | egui/wgpu windows with the paper-rs theme. A scripted app session tests preview, record via the hotkey's command, pause/resume, stop and save, the settings window, and closing the window. The exact CLI line from the goal works and yields 600 frames and 10.000 s. |
-| 7 | Performance and reliability: about 0 dropped frames at 4K60, low CPU, 30-minute soak, ffprobe numbers in PERFORMANCE.md | **Done; one re-run pending permissions** | [PERFORMANCE.md](PERFORMANCE.md). Soak 1 (30 min, 4K60, screen + system audio + mic + webcam): 107,955 of 108,000 frames. The 45 drops all came from one 5-s encoder stall; the writer now retries instead of dropping. All tracks ended within 0.1 ms; mean CPU 34%; no memory growth. Soak 2 runs on the fixed build with screen and system audio. Repeating the full webcam soak needs the mic and camera grants back. |
+| 7 | Performance and reliability: about 0 dropped frames at 4K60, low CPU, 30-minute soak, ffprobe numbers in PERFORMANCE.md | **Done** | [PERFORMANCE.md](PERFORMANCE.md). Soak 1 (30 min, 4K60, screen + system audio + mic + webcam): 107,955 of 108,000 frames; the 45 drops all came from one 5-s encoder stall, and the writer now retries instead of dropping. Soak 2 on the fixed build (4K60, screen + system audio): **108,000 of 108,000 frames, 0 dropped**, exact 16.667 ms spacing, 6% CPU, flat memory. In both, all tracks ended within 0.1 ms. Soak 3 (webcam, fixed build) was cut by the lid closing at 10:44 (21.7-s display reconfiguration, camera unavailable); the file stayed valid and in sync. |
 
-Tests: `cargo test` runs 18 unit tests. `scripts/selftest.sh` currently reports 7 passed and
-3 skipped; the skips are the mic and camera cases, waiting on the grants. Before the reset it
-passed 11 of 11.
+Tests: `cargo test` runs 18 unit tests, and `scripts/selftest.sh` passes 13 of 13 with all
+permissions granted. The suite covers:
+
+- every pipeline;
+- sync, audio gaps and pause;
+- Dock quit;
+- the scripted app session.
 
 **Dock icon (your request, 2026-10-11).** `support/AppIcon.icns` is copied into
 `Contents/Resources`, and the icon is also set at launch. Verified:
@@ -73,12 +62,15 @@ passed 11 of 11.
 | Permission | Status |
 |---|---|
 | Screen & System Audio Recording | granted to **Rec** |
-| Microphone | **reset by macOS; re-approve** (see the top of this file) |
-| Camera | **reset by macOS; re-approve** |
+| Microphone | granted (re-approved by you after the 09:12 request) |
+| Camera | granted (re-approved) |
 
 - **Grant history.** The first request ran on 2026-10-10 at 23:32. All three grants survived
   renaming the executable and every rebuild until the Dock-app change. After macOS reset the mic
-  and camera grants, I ran the request once more at 09:12; it is still pending.
+  and camera grants, I ran the request once more at 09:12. Both are granted again as of about
+  10:00. Between 08:35 and 09:10 macOS had reset them, probably because the bundle changed from a
+  menu bar-only app to a Dock app (`LSUIElement`). If they reset again, run
+  `dist/rec-rs permissions --request`.
 - **Picker prompt.** If macOS shows "Rec is requesting to bypass the system private window
   picker", click **Allow**. macOS repeats this periodically for every recorder.
 - **System Events prompt.** If you see a prompt asking whether a terminal process may **control
@@ -143,6 +135,15 @@ These are tracked in the README under "Known gaps".
   - **App rebuilt.** Replaced the AppKit menu bar app with the egui app: main window, settings
     window, menu bar item and meters.
   - **Milestone 7.** Soak script, 30-minute soak and PERFORMANCE.md.
+- **2026-10-11 09:35–10:25:**
+  - Soak 2 came back clean.
+  - Crash test passed with 2 s fragments.
+  - An end-to-end sync test through AVPlayer found system audio about 25 ms early. The cause is
+    ScreenCaptureKit capturing audio at mix time; the fix shifts it by the output latency.
+  - Mic and camera are granted again, and the self-test passes 13 of 13.
+  - Soak 3 (the full webcam setup) ran on the fixed build. It was disturbed when the lid was
+    closed at 10:44 (clamshell mode), which made screen frames freeze for 21.7 s and the built-in
+    camera disappear. The file stayed valid and in sync.
 - **2026-10-11 09:05–09:35:** Your Dock icon, with the Dock quit and reopen hooks.
   - The soak's 45 drops led to the writer retrying a busy encoder instead of dropping frames.
   - While measuring I found and fixed an intermittent -10 ms audio shift (lost or early audio

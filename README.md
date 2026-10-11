@@ -163,6 +163,7 @@ frames, and pauses don't count.
 | `--pip-size`, `--pip-corner`, `--pip-shape`, `--no-mirror` | `0.22`, bottom-right, rounded | Shape: `rounded`, `circle`, `rect`. |
 | `--audio-tracks` | `both` | `both` = mix plus system and mic stems; `mix`; `stems`. |
 | `--system-gain`, `--mic-gain` | `0` | dB, in the mix track. |
+| `--system-audio-offset-ms`, `--mic-offset-ms` | output latency, `0` | Sync offsets. System audio is shifted by the output device's latency by default (see Output format). |
 | `--no-cursor`, `--clicks` | cursor shown | |
 | `-t, --duration` | | Seconds of output. |
 | `--mic-backend` | `sck` | `sck` (ScreenCaptureKit) or `avcapture`. |
@@ -194,6 +195,10 @@ Other commands:
 - **Single clock.** Screen, system audio, mic and webcam are all stamped on the host clock, and
   audio is never stretched. The flash/beep sync test measures 0.0 ms between video and audio in
   the file, including across pauses.
+- **System audio latency.** ScreenCaptureKit captures system audio when it is mixed, which is
+  one output latency before you hear it. rec-rs shifts it later by the output device's latency,
+  read from CoreAudio (about 27 ms on built-in speakers, more on Bluetooth), so the audio lines
+  up with the picture you saw. `rec-rs devices` prints the latency.
 - **Webcam sync.** Emission runs a little behind real time, so the webcam frame captured at each
   instant is the one used. Webcams deliver frames 70–120 ms late, and the lag adapts to the
   slowest source.
@@ -244,6 +249,8 @@ Other commands:
   hotkey isn't configurable.
 - **8-bit SDR only.** HDR displays are tone-mapped by ScreenCaptureKit.
 - **Webcam overlay.** The overlay is burned into the video; there is no separate camera track.
+- **Output latency read once.** It is read when recording starts. Switching output devices
+  mid-recording (to AirPods, say) leaves the old offset in place.
 - **Mix track resampling.** A mic that isn't 48 kHz is resampled linearly per buffer for the mix
   track. The mic stem is converted by AVFoundation.
 - **Re-confirmation prompt.** macOS periodically asks you to re-confirm screen recording for
