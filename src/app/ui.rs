@@ -163,6 +163,17 @@ fn preview(ui: &mut Ui, st: &mut State) {
             egui::pos2((rect.min.x * ppp).round() / ppp, (rect.min.y * ppp).round() / ppp),
             rect.size(),
         );
+        // REC_DEBUG_PREVIEW: where the preview is, in window pixels (for
+        // comparing it against a screenshot of the screen).
+        if std::env::var_os("REC_DEBUG_PREVIEW").is_some() {
+            eprintln!(
+                "rec: preview rect {} {} {} {}",
+                (rect.min.x * ppp).round(),
+                (rect.min.y * ppp).round(),
+                (rect.width() * ppp).round(),
+                (rect.height() * ppp).round()
+            );
+        }
         let r = CornerRadius::same(10);
         ui.painter().rect_filled(rect, r, Color32::BLACK);
         let live = st.recording.is_some() || st.preview.is_some();

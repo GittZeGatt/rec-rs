@@ -1,5 +1,26 @@
 # PROGRESS
 
+## Dark preview (your bug report, 2026-10-12 ~11:30): fixed
+
+- **Cause.** The new zero-copy preview texture was created as `BGRA8Unorm_sRGB`. egui treats
+  texture values as gamma-encoded, so the GPU's sRGB-to-linear decode on sampling darkened
+  everything. Mid-gray 128 showed as 47, and midtones were about 75% too dark. It is now a plain
+  `BGRA8Unorm`, guarded by a unit test.
+- **Verified against a native screenshot** of a test card (`scripts/testcard.swift ... screen
+  front`) previewed by the app:
+
+  | | Native 64 / 128 / 192 shown as | Mean luma |
+  |---|---|---|
+  | Before | 18 / 47 / 116 | −76% |
+  | After | 64 / 127 / 192 | −0.1% |
+
+- **The recording was not affected.** Its pixels match the screen exactly (BT.709 decode: 64 /
+  128 / 191, midtones +0.2%; range, matrix and scaler are correct). QuickTime shows screen
+  recordings about 9% lighter in the midtones, because it applies the BT.709 curve to
+  sRGB-encoded screen pixels. That is the same for any recorder that tags BT.709. Tagging the
+  sRGB curve instead would make QuickTime exact, at some risk with editors, so it's left as it
+  was. Say if you want it.
+
 ## 4K quality: sharp preview, native capture, high-quality streaming (your request, 2026-10-12): done
 
 All measured with SSIM-Y / PSNR-Y (dB) / VMAF against lossless references.

@@ -6,9 +6,12 @@
 //!    pixel size (`scale::FrameScaler`, the recording's scaler).
 //! 2. A YCbCr frame is converted to BGRA by a VideoToolbox pixel transfer
 //!    (BT.709, hardware).
-//! 3. The BGRA frame's IOSurface becomes an sRGB Metal texture that wgpu and
-//!    egui sample directly: no CPU readback, swizzle or upload, and no second
-//!    scaling (the UI draws it pixel-aligned at its native size).
+//! 3. The BGRA frame's IOSurface becomes a Metal texture that wgpu and egui
+//!    sample directly: no CPU readback, swizzle or upload, and no second
+//!    scaling (the UI draws it pixel-aligned at its native size). It is a
+//!    plain (non-sRGB) format on purpose: egui works on gamma-encoded
+//!    values and expects its textures as such; an sRGB format would decode
+//!    them to linear on sampling and darken the preview (mid-gray 128 -> 48).
 //!
 //! Steps 1 and 2 run on a worker thread (they wait for the GPU); the UI
 //! thread only wraps the result. Low power: half the resolution at 15 fps.
@@ -114,6 +117,11 @@ pub fn target_size(fw: usize, fh: usize, area: (u32, u32), low_power: bool) -> (
 }
 
 type Pool = SendBox<CFRetained<CVPixelBufferPool>>;
+
+/// The preview texture's format: plain BGRA, not sRGB (see the module docs:
+/// egui expects gamma-encoded textures).
+const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+const MTL_FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
 
 /// A preview frame ready to draw: a wgpu texture over the frame's IOSurface.
 pub struct Frame {
@@ -221,7 +229,7 @@ fn texture_from_buffer(device: &wgpu::Device, buf: &CVPixelBuffer, w: u32, h: u3
         let hal = device.as_hal::<Metal>()?;
         let mtl: &Retained<ProtocolObject<dyn MTLDevice>> = hal.raw_device();
         let desc = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-            MTLPixelFormat::BGRA8Unorm_sRGB,
+            MTL_FORMAT,
             w as usize,
             h as usize,
             false,
@@ -231,7 +239,7 @@ fn texture_from_buffer(device: &wgpu::Device, buf: &CVPixelBuffer, w: u32, h: u3
         drop(hal);
         let hal_tex = wgpu::hal::metal::Device::texture_from_raw(
             raw,
-            wgpu::TextureFormat::Bgra8UnormSrgb,
+            TEXTURE_FORMAT,
             MTLTextureType::Type2D,
             1,
             1,
@@ -246,7 +254,7 @@ fn texture_from_buffer(device: &wgpu::Device, buf: &CVPixelBuffer, w: u32, h: u3
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                format: TEXTURE_FORMAT,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -364,6 +372,15 @@ mod tests {
             );
             write_bgra(&last.unwrap(), &format!("{out}.old.bgra"));
         }
+    }
+
+    /// An sRGB texture would be decoded to linear when sampled, and egui
+    /// treats samples as gamma-encoded: the preview came out far too dark
+    /// (mid-gray 128 shown as 47).
+    #[test]
+    fn preview_texture_is_not_srgb() {
+        assert!(!TEXTURE_FORMAT.is_srgb());
+        assert_eq!(MTL_FORMAT, MTLPixelFormat::BGRA8Unorm);
     }
 
     #[test]

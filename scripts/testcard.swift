@@ -1,17 +1,22 @@
 // A static text test card for capture-quality measurements.
 //
-//   swift scripts/testcard.swift OUT.png [SECONDS]
+//   swift scripts/testcard.swift OUT.png [SECONDS [screen [front]]]
 //
 // Draws a deterministic 5120x2880 card (UI text at several sizes, code,
 // colored text, 1 px lines, a gradient) into OUT.png and, if SECONDS is
-// given, shows it 1:1 in a borderless window on a 2x display of that size,
+// given, shows it 1:1 in a borderless window on a 2x display of that size
+// (with `screen`: on the first 2x display, the card sized to it; with
+// `front`: in front of other windows, for display-capture checks),
 // ordered behind other windows (window capture reads it anyway). Prints
 // `window <id>` once it is on screen. scripts/quality.sh uses it.
 
 import AppKit
 
-let W = 5120, H = 2880
 let args = CommandLine.arguments
+let fitScreen = args.count >= 4 && args[3] == "screen"
+let fitted = fitScreen ? NSScreen.screens.first(where: { $0.backingScaleFactor == 2 }) : nil
+let W = fitted.map { Int($0.frame.width) * 2 } ?? 5120
+let H = fitted.map { Int($0.frame.height) * 2 } ?? 2880
 guard args.count >= 2 else { print("usage: testcard.swift OUT.png [SECONDS]"); exit(2) }
 
 func card() -> CGImage {
@@ -90,6 +95,6 @@ view.layer!.contentsGravity = .topLeft
 view.layer!.magnificationFilter = .nearest
 win.contentView = view
 win.setFrame(screen.frame, display: true)
-win.orderBack(nil)
+if args.count >= 5 && args[4] == "front" { win.orderFrontRegardless() } else { win.orderBack(nil) }
 print("window \(win.windowNumber)"); fflush(stdout)
 RunLoop.main.run(until: Date(timeIntervalSinceNow: secs))
