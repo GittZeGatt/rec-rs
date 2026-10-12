@@ -784,7 +784,7 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
             let c = s.live_config();
             ui.label(
                 RichText::new(format!(
-                    "{}x{} {} at {:.1} Mb/s (never above the recording size)",
+                    "Up to {}x{} {} at {:.1} Mb/s (the frame keeps its shape, never above the recording size)",
                     c.width,
                     c.height,
                     if c.hevc { "HEVC" } else { "H.264" },

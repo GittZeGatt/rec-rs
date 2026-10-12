@@ -37,8 +37,9 @@ for its architecture only and no OBS code was copied. See
 
 ![Rec main window: live preview of the recorded screen, scene picker, sources, record button and level meters](docs/screenshots/main.png)
 
-*The main window: a live preview of exactly what gets recorded, the scene picker (Screen,
-Screen + Cam, Camera), sources, record/pause, the timer and level meters.*
+*The main window: a live preview of exactly what gets recorded (here a window showing a test
+card), the scene picker (Screen, Screen + Cam, Camera), sources, audio, replay buffer and
+stream, record/pause, the timer and level meters.*
 
 | Screen + Cam, squircle with a white border | Screen + Cam, circle moved off the corner |
 |---|---|
@@ -46,7 +47,8 @@ Screen + Cam, Camera), sources, record/pause, the timer and level meters.*
 
 *Drag the camera anywhere in the preview, or snap it to a corner. It can be a circle, rounded
 rectangle, square, pill or squircle, with adjustable roundness, border and shadow. Every change
-is live and baked into the recording. The camera here is a virtual camera with a blank feed.*
+is live and baked into the recording. The camera here is a virtual camera with a blank feed
+(these two are from an earlier build; the overlay controls are unchanged).*
 
 | Settings | Menu bar |
 |---|---|
@@ -105,10 +107,10 @@ open dist/Rec.app          # or: dist/rec-rs   (or: dist/rec-rs gui [--settings]
 
 The **main window** contains:
 
-- **Live preview** of exactly what will be recorded, including the webcam overlay. Rec's own
-  windows are excluded from capture. It is rendered at the preview's exact size in pixels
-  (2x on Retina) with the Lanczos scaler and drawn 1:1, color-managed for the display, without
-  copying frames through the CPU. Settings has a low-power option (half resolution, 15 fps),
+- **Live preview** of exactly what will be recorded, including the webcam overlay, edge to
+  edge in the source's shape. Rec's own windows are excluded from capture. It is rendered at
+  the preview's exact size in pixels (2x on Retina) with the Lanczos scaler and drawn 1:1,
+  without copying frames through the CPU. Settings has a low-power option (half resolution, 15 fps),
   and nothing is drawn while the window is hidden or the screen is locked.
 - **Scene**:
   - Screen.
@@ -151,7 +153,8 @@ The **main window** contains:
 The **settings window** (⌘, or the Settings… button) covers:
 
 - Output folder and container (`.mov` or `.mp4`).
-- Resolution: 720p, 1080p, 1440p, 4K or native.
+- Resolution: 720p, 1080p, 1440p, 4K or native. The frame always has the shape of the display
+  or window (4K of a 16:10 display is 3456x2160): no black bars, nothing cropped.
 - Frame rate, codec (auto, H.264, HEVC, ProRes) and bitrate.
 - Cursor and click highlighting.
 - Audio devices, track layout and gains.
@@ -230,7 +233,7 @@ frames, and pauses don't count.
 | `--replay SECS` | off | Keep the last 15–300 s of the live encode in memory; `rec-rs save-replay` writes them to an MP4 next to the output. |
 | `--stream DEST` | | Stream to `youtube`, `twitch`, an `rtmp://`/`rtmps://` URL or a WHIP `http(s)://` URL. Repeatable: one encode feeds every destination. |
 | `--no-record` | | Write no file (replay buffer and/or streaming only). |
-| `--live-resolution` | `1080p` | Live encode size (never above the capture). |
+| `--live-resolution` | `1080p` | Live encode bounding size: the frame keeps its shape and is never above the capture. |
 | `--stream-bitrate` | platform preset | Live video kb/s. By default the platform's recommendation for the size and frame rate: YouTube 2160p60 45 Mb/s H.264 or 35 HEVC (2160p30 35/25, 1440p 24/16, 1080p 12/10); Twitch at most 6 Mb/s and 1080p; others like YouTube. |
 | `--stream-codec` | `auto` | `auto` (HEVC when every destination is YouTube), `h264` or `hevc` (HEVC Main10 over enhanced RTMP or WHIP H.265; a server that refuses it gets H.264). |
 | `--keyframe` | `2` | Live keyframe interval in seconds (0.5–4). |
@@ -310,6 +313,17 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 - **Crash-safe.** Movie fragments are written every 2 s, so a crash or power loss leaves a
   playable file up to the last fragment. A normal stop finalizes a regular movie
   (`ftyp wide mdat moov`).
+- **Edge to edge.** The frame has the source's aspect ratio, so the picture fills it with no
+  letterbox or pillarbox bars. A single window's transparent rounded corners are filled with
+  the window's own edge color instead of encoding as black.
+- **Camera.** In the app the running camera passes from the preview to the recording and
+  back, so a recording starts with the exposure already settled. A camera started cold (CLI)
+  is given 2 s to settle before the file starts, so it never opens on black or dark frames.
+- **Audio quality.** System audio and the mic are captured at 48 kHz; a device at another rate
+  (44.1 kHz USB, 16/24 kHz Bluetooth) is resampled with a windowed-sinc filter that is
+  continuous across buffers. The mix runs through a limiter that keeps it under −1 dBFS
+  instead of clipping. Measured with a sweep, tones and noise played as system audio: flat
+  within 0.1 dB from 50 Hz to 20 kHz, no clicks.
 - **Pause.** Pauses cut whole frame slots out of the timeline. Audio is cut at the exact sample
   and shifted with the video, so there is no gap and no drift.
 

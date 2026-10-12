@@ -1,5 +1,24 @@
 # PROGRESS
 
+## Your fix list (2026-10-12 evening): done
+
+Every item was measured on real recordings in `~/Movies/rec-rs-tests/goal/` (camera clips
+deleted after checking).
+
+| Item | Cause | Fix | Check |
+|---|---|---|---|
+| Black bars and corners | `-r 1080p`/`4k` were exact 16:9 frames, so the 1.547 display was pillarboxed (1920x1080 with black sides). Window captures arrive with transparent rounded corners, which encoded as black. The preview drew a rounded image over black. | Every size keeps the source's shape (1080p = 1670x1080 here, 4K = 3342x2160), even, never upscaled. Scaler and compositor fill edge to edge. Window corners are filled with the window's edge color. Preview drawn square. | Display at 720p/1080p/4K/native and windows at 720p/1080p/native: 0% black pixels on every edge and corner (was 100% on the sides). Preview reaches all four corners. |
+| Green bar on the left | The Lanczos scaler read zeros past the source's edge: Cb = Cr = 0 is green. | Clamp edge mode. | Column 0 of a 1080p recording: (25,42,23) before, neutral (42,42,45) after. |
+| Camera darker | Not the color path (camera 178.2 -> file 178.2). Each recording restarted the camera: 0.5 s of black, then a 2.5 s exposure ramp (Y 117 -> 164). | The warm camera passes preview -> recording -> preview. A cold camera gets 2 s before the file starts. | App recording: camera Y 149 from the first frame, flat. CLI cold start: 147 (was 16, then 117). |
+| Audio quality | Per-buffer linear resampling for non-48 kHz devices (a buzz at buffer edges, aliasing); hard clipping of the mix; live mix ignored the gains; mic stem 128 kb/s, live 160 kb/s. | Streaming windowed-sinc resampler; -1 dBFS limiter; gains in the live mix; mic stem 192 kb/s, live 192 kb/s, live encoder at max quality. | Reference sweep/tones/noise as system audio: flat within 0.1 dB, 50 Hz-20 kHz, no clicks; mix with +6 dB gain peaks at -0.3 dBFS, 0 clipped samples. |
+
+Notes:
+
+- The capture's own system-audio path was already clean. The mic is the raw built-in mic: no
+  noise suppression, and it picks up the speakers.
+- macOS reset the camera grant; I requested it once at 18:40 and it was approved.
+- Your saved settings are 4K: recordings are now 3342x2160 instead of 3840x2160 with bars.
+
 ## Dark preview (your bug report, 2026-10-12 ~11:30): fixed
 
 - **Cause.** The new zero-copy preview texture was created as `BGRA8Unorm_sRGB`. egui treats
@@ -224,7 +243,7 @@ permissions granted. The suite covers:
 |---|---|
 | Screen & System Audio Recording | granted to **Rec** |
 | Microphone | granted (re-approved by you after the 09:12 request) |
-| Camera | granted (re-approved) |
+| Camera | granted (macOS reset it; requested once on 2026-10-12 at 18:40 and approved) |
 
 - **Grant history.** The first request ran on 2026-10-10 at 23:32. All three grants survived
   renaming the executable and every rebuild until the Dock-app change. After macOS reset the mic
