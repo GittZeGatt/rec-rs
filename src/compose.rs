@@ -405,8 +405,8 @@ impl Compositor {
             if let Some(screen) = screen {
                 let sc = CIImage::imageWithCVPixelBuffer(screen);
                 let se = sc.extent();
-                // Fit the screen into the canvas (a no-op normally: SCK
-                // already delivers the output size).
+                // Fit the screen into the canvas (a no-op normally: the
+                // sink scales native-size captures to the output size).
                 let (s, tx, ty) = fit(se.size.width, se.size.height, self.w, self.h, false);
                 img = sc.imageByApplyingTransform(CGAffineTransform { a: s, b: 0.0, c: 0.0, d: s, tx, ty }).imageByCompositingOverImage(&img);
             }

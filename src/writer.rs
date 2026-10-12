@@ -230,6 +230,12 @@ pub struct Sink {
     cam_q: VecDeque<(f64, Pb)>,
     cam_last: Option<Pb>,
     compositor: Option<Compositor>,
+    /// Scales native-size screen frames to the output size.
+    scaler: Option<crate::scale::FrameScaler>,
+    /// Output-size buffers for scaled screen frames fed to the compositor.
+    scaled_pool: Option<CFRetained<CVPixelBufferPool>>,
+    /// Output size and pixel format (for a pool created later).
+    out_spec: (usize, usize, u32),
     pub stats: Stats,
     failed: Option<String>,
     levels: [f32; 2],
@@ -350,6 +356,9 @@ impl Sink {
             cam_q: VecDeque::new(),
             cam_last: None,
             compositor,
+            scaler: None,
+            scaled_pool: None,
+            out_spec: (v.width, v.height, v.pixel_format),
             stats: Stats::default(),
             failed: None,
             levels: [0.0; 2],
@@ -432,6 +441,18 @@ impl Sink {
 
     pub fn is_paused(&self) -> bool {
         self.pauses.is_paused()
+    }
+
+    /// Screen frames arrive at their native size: scale them to the output.
+    pub fn set_scaler(&mut self, scaler: crate::scale::FrameScaler) {
+        let (w, h, f) = self.out_spec;
+        if self.out.is_none() && self.own_pool.is_none() {
+            self.own_pool = Some(make_pool(w, h, f));
+        }
+        if self.compositor.is_some() {
+            self.scaled_pool = Some(make_pool(w, h, f));
+        }
+        self.scaler = Some(scaler);
     }
 
     pub fn set_live(&mut self, live: std::sync::Arc<crate::live::Live>) {
@@ -724,7 +745,21 @@ impl Sink {
                 continue;
             }
             let mut write = write;
-            let screen = self.screen_last.as_ref().map(|s| s.0.clone());
+            let mut screen = self.screen_last.as_ref().map(|s| s.0.clone());
+            // A native-size capture going through the compositor: scale it
+            // first (the compositor then draws it 1:1).
+            if let (Some(sc), Some(pool), Some(src)) = (self.scaler.as_mut(), &self.scaled_pool, screen.as_deref())
+                && sc.needed(src)
+            {
+                let mut buf = std::ptr::null_mut();
+                unsafe { CVPixelBufferPool::create_pixel_buffer(None, pool, std::ptr::NonNull::from(&mut buf)) };
+                if let Some(b) = std::ptr::NonNull::new(buf) {
+                    let b: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(b) };
+                    if sc.scale(src, &b) {
+                        screen = Some(b);
+                    }
+                }
+            }
             if screen.is_none() && self.scene != Scene::Cam {
                 continue;
             }
@@ -751,6 +786,19 @@ impl Sink {
                 let cam = self.cam_last.as_ref().map(|b| b.0.clone());
                 let scene = self.scene;
                 self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam.as_deref(), &buf);
+                buf
+            } else if self.scaled_pool.is_none()
+                && let Some(sc) = &self.scaler
+                && sc.needed(screen.as_deref().unwrap())
+            {
+                let Some(buf) = self.new_output_buffer() else {
+                    if write {
+                        self.stats.video_drops += 1;
+                        self.out_slot += 1;
+                    }
+                    continue;
+                };
+                self.scaler.as_mut().unwrap().scale(screen.as_deref().unwrap(), &buf);
                 buf
             } else {
                 screen.unwrap()

@@ -77,6 +77,10 @@ extern "C" fn on_signal(_: libc::c_int) {
 pub struct Options {
     pub output: PathBuf,
     pub size: (usize, usize),
+    /// The capture target's native pixel size. Larger targets are captured
+    /// at this size and scaled with `scale::FrameScaler` (ScreenCaptureKit's
+    /// own downscale is soft).
+    pub native: (usize, usize),
     pub fps: u32,
     pub codec: Codec,
     pub bitrate: u64,
@@ -152,6 +156,16 @@ pub struct Session {
     pub description: String,
 }
 
+/// Size ScreenCaptureKit delivers: the native size when it is larger than
+/// the output (scaled down here with a high-quality filter), else the output
+/// size. `REC_SCALER=sck` keeps ScreenCaptureKit's own scaling.
+fn capture_size(o: &Options) -> (usize, usize) {
+    let (w, h) = o.size;
+    let (nw, nh) = o.native;
+    let sck = std::env::var("REC_SCALER").as_deref() == Ok("sck");
+    if o.test_pattern.is_none() && !sck && nw * nh > w * h { (nw, nh) } else { (w, h) }
+}
+
 impl Session {
     /// Start capturing. `write` false = preview-only (nothing written).
     pub fn start(o: &Options, target: Option<screen::Target>, write: bool, preview: Option<PreviewFn>) -> Result<Session> {
@@ -161,6 +175,11 @@ impl Session {
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
         let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, o.scene, preview)?;
+        if capture_size(o) != (w, h)
+            && let Some(sc) = crate::scale::FrameScaler::new(w, h)
+        {
+            sink.set_scaler(sc);
+        }
         sink.limit_secs(o.duration);
         // System audio from ScreenCaptureKit is captured when mixed and heard
         // one output latency later; the synthetic source needs no shift.
@@ -257,10 +276,11 @@ impl Session {
             }
             (None, Some(target)) => {
                 self.description = target.describe();
+                let (cw, ch) = capture_size(o);
                 let cfg = ScreenConfig {
                     target,
-                    width: w,
-                    height: h,
+                    width: cw,
+                    height: ch,
                     fps: o.fps,
                     pixel_format,
                     cursor: o.cursor,

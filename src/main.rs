@@ -8,6 +8,7 @@ mod outlatency;
 mod play;
 mod probe;
 mod record;
+mod scale;
 mod screen;
 mod settings;
 mod synth;
@@ -348,6 +349,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
     let mut opts = record::Options {
         output: a.output.unwrap_or_else(default_output),
         size: (0, 0),
+        native: (0, 0),
         fps: a.fps,
         codec: Codec::H264,
         bitrate: 0,
@@ -432,6 +434,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         bail!("ProRes needs a .mov output");
     }
     opts.size = (w, h);
+    opts.native = (native.0 & !1, native.1 & !1);
     if a.no_record && a.replay.is_none() && a.stream.is_empty() {
         bail!("--no-record needs --replay or --stream");
     }
