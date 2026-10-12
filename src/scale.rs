@@ -23,7 +23,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_core_foundation::{CFRetained, CFString, CFType};
 use objc2_core_video::*;
 use objc2_metal::*;
-use objc2_metal_performance_shaders::{MPSImageLanczosScale, MPSScaleTransform, MPSUnaryImageKernel};
+use objc2_metal_performance_shaders::{MPSImageEdgeMode, MPSImageLanczosScale, MPSScaleTransform, MPSUnaryImageKernel};
 use objc2_video_toolbox::*;
 
 use crate::util::*;
@@ -88,6 +88,11 @@ fn metal() -> Option<Metal> {
         }
         let cache = CFRetained::from_raw(std::ptr::NonNull::new(cache)?);
         let lanczos = MPSImageLanczosScale::initWithDevice(MPSImageLanczosScale::alloc(), &device);
+        // Taps past the source's edges repeat the edge pixel. The default
+        // (zero) pulls the outer rows and columns toward 0: darker luma and,
+        // on the chroma plane, Cb = Cr = 0, a green line along the left and
+        // top edges of every scaled frame.
+        lanczos.setEdgeMode(MPSImageEdgeMode::Clamp);
         Some(Metal { queue, cache, lanczos })
     }
 }
