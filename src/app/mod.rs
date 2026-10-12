@@ -90,6 +90,9 @@ struct Win {
     ctx: egui::Context,
     renderer: egui_wgpu::Renderer,
     repaint_at: Option<Instant>,
+    /// Fully covered, minimized or the screen locked: nothing would be
+    /// presented, so don't draw.
+    occluded: bool,
 }
 
 struct Gpu {
@@ -141,7 +144,10 @@ pub struct State {
     pub cameras: Vec<Device>,
     pub mics: Vec<Device>,
     pub hotkey_ok: bool,
-    pub preview_tex: Option<egui::TextureHandle>,
+    /// The preview frame as a native (IOSurface-backed) egui texture.
+    pub preview_tex: Option<egui::TextureId>,
+    /// Its size in pixels.
+    pub preview_px: [u32; 2],
     pub preview_aspect: f32,
     /// Preview frames shown (for the self-test).
     frames_shown: u64,
@@ -250,6 +256,8 @@ struct App {
     menubar: Option<menubar::MenuBar>,
     _main_menu: Option<objc2::rc::Retained<menubar::Target>>,
     scaler: preview::Scaler,
+    /// Textures of the last preview frames (egui may still draw them).
+    preview_textures: std::collections::VecDeque<wgpu::Texture>,
     last_tick: Instant,
     last_meter: Instant,
     start_recording: bool,
@@ -297,6 +305,7 @@ impl App {
             mics: vec![],
             hotkey_ok: true,
             preview_tex: None,
+            preview_px: [0, 0],
             preview_aspect: 16.0 / 9.0,
             frames_shown: 0,
             cmds: vec![],
@@ -325,6 +334,7 @@ impl App {
             menubar: None,
             _main_menu: None,
             scaler: preview::Scaler::new(),
+            preview_textures: Default::default(),
             last_tick: Instant::now(),
             last_meter: Instant::now(),
             start_recording,
@@ -415,8 +425,11 @@ impl App {
         );
         let (x, y) = theme::TRAFFIC_LIGHTS;
         macos::inset_traffic_lights(&window, x, y);
+        // egui and the preview are sRGB: let macOS convert them for the
+        // display (wide-gamut panels otherwise show them oversaturated).
+        macos::tag_layers_srgb(&window);
         window.request_redraw();
-        Win { window, surface, config, egui, ctx, renderer, repaint_at: None }
+        Win { window, surface, config, egui, ctx, renderer, repaint_at: None, occluded: false }
     }
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
@@ -783,18 +796,28 @@ impl App {
 
     fn redraw(&mut self, which: WindowId) {
         let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == which);
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        preview::set_low_power(self.st.settings.preview_low_power);
         if is_main
-            && let Some(img) = self.scaler.take()
+            && let Some(f) = self.scaler.take(&gpu.device)
+            && let Some(w) = self.main.as_mut()
         {
-            self.st.preview_aspect = img.size[0] as f32 / img.size[1] as f32;
-            let w = self.main.as_ref().unwrap();
-            match &mut self.st.preview_tex {
-                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                None => self.st.preview_tex = Some(w.ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
+            self.st.preview_aspect = f.size[0] as f32 / f.size[1] as f32;
+            self.st.preview_px = f.size;
+            let view = f.texture.create_view(&Default::default());
+            // Drawn pixel-aligned at its own size: nearest is exact, and
+            // avoids a blur when the area is mid-resize.
+            let filter = wgpu::FilterMode::Nearest;
+            match self.st.preview_tex {
+                Some(id) => w.renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &view, filter, id),
+                None => self.st.preview_tex = Some(w.renderer.register_native_texture(&gpu.device, &view, filter)),
+            }
+            self.preview_textures.push_back(f.texture);
+            while self.preview_textures.len() > 2 {
+                self.preview_textures.pop_front();
             }
             self.st.frames_shown += 1;
         }
-        let Some(gpu) = self.gpu.as_ref() else { return };
         let win = if is_main { self.main.as_mut() } else { self.settings_win.as_mut() };
         let Some(win) = win else { return };
         let input = win.egui.take_egui_input(&win.window);
@@ -903,6 +926,7 @@ impl ApplicationHandler for App {
         self.tick(el);
         if let Some(w) = &self.main
             && self.main_visible
+            && !w.occluded
         {
             w.window.request_redraw();
         }
@@ -933,6 +957,15 @@ impl ApplicationHandler for App {
                 }
                 win.window.request_redraw();
             }
+            WindowEvent::Occluded(o) => {
+                win.occluded = o;
+                if !o {
+                    win.window.request_redraw();
+                }
+                if is_main {
+                    preview::set_wanted(self.main_visible && !o);
+                }
+            }
             WindowEvent::ThemeChanged(_) => {
                 theme::set_accent(theme::system_accent());
                 theme::apply(&win.ctx);
@@ -962,13 +995,26 @@ impl ApplicationHandler for App {
         let live = self.st.recording.is_some() || self.st.preview.is_some() || self.st.finishing || self.st.stream_id.is_some();
         let now = Instant::now();
         let mut next = now + Duration::from_millis(if live { 100 } else { 250 });
+        // The occlusion event only reports changes (not a window created
+        // while the screen is locked): ask AppKit each pass.
+        for (w, main) in [(self.main.as_mut(), true), (self.settings_win.as_mut(), false)] {
+            if let Some(w) = w {
+                let o = macos::is_occluded(&w.window);
+                if o != w.occluded {
+                    w.occluded = o;
+                    if main {
+                        preview::set_wanted(self.main_visible && !o);
+                    }
+                }
+            }
+        }
         for w in [self.main.as_mut(), self.settings_win.as_mut()].into_iter().flatten() {
-            let visible = w.window.is_visible().unwrap_or(true);
+            let visible = w.window.is_visible().unwrap_or(true) && !w.occluded;
             if live && visible {
                 // Timer, meters: ~15 fps; preview frames wake us on arrival.
                 w.window.request_redraw();
             }
-            if let Some(t) = w.repaint_at {
+            if let Some(t) = w.repaint_at.filter(|_| !w.occluded) {
                 if t <= now {
                     w.repaint_at = None;
                     w.window.request_redraw();

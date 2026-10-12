@@ -16,6 +16,38 @@ fn ns_window(window: &Window) -> Option<objc2::rc::Retained<NSWindow>> {
     view.window()
 }
 
+/// Whether none of the window can be seen (covered, minimized, on another
+/// Space, or the screen locked): drawing it would be wasted.
+pub fn is_occluded(window: &Window) -> bool {
+    ns_window(window).is_some_and(|w| !w.occlusionState().contains(objc2_app_kit::NSWindowOcclusionState::Visible))
+}
+
+/// Tag the window's Metal layers sRGB, so the window server color-manages
+/// what we draw (sRGB values) for the display instead of showing them as
+/// display-native values.
+pub fn tag_layers_srgb(window: &Window) {
+    use objc2::runtime::AnyObject;
+    use objc2::{msg_send, ClassType};
+    let RawWindowHandle::AppKit(h) = window.window_handle().map(|h| h.as_raw()).unwrap_or(RawWindowHandle::Web(winit::raw_window_handle::WebWindowHandle::new(0))) else {
+        return;
+    };
+    // SAFETY: valid NSView on the main thread (see `ns_window`).
+    let view: &NSView = unsafe { h.ns_view.cast().as_ref() };
+    let Some(cs) = objc2_core_graphics::CGColorSpace::with_name(Some(unsafe { objc2_core_graphics::kCGColorSpaceSRGB })) else { return };
+    unsafe {
+        let Some(root) = view.layer() else { return };
+        let mut layers = vec![root.clone()];
+        if let Some(subs) = root.sublayers() {
+            layers.extend(subs.iter());
+        }
+        for l in layers {
+            let any: &AnyObject = &l;
+            if any.class().name().to_str().unwrap_or("") == objc2_quartz_core::CAMetalLayer::class().name().to_str().unwrap_or("-") {
+                let _: () = msg_send![any, setColorspace: &*cs];
+            }
+        }
+    }
+}
 
 /// Move the close/minimise/zoom buttons so they start `x` points from the left and are
 /// vertically centred in a titlebar area `bar_h` points tall (our toolbar). AppKit lays the

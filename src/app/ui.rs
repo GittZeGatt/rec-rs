@@ -141,20 +141,34 @@ fn preview(ui: &mut Ui, st: &mut State) {
         ui.add_space(10.0);
     }
     let avail = ui.available_size();
+    let ppp = ui.ctx().pixels_per_point();
+    // The scaler renders frames at exactly this many pixels (aspect kept).
+    super::preview::set_target((avail.x * ppp).floor() as u32, (avail.y * ppp).floor() as u32);
     let aspect = st.preview_aspect.max(0.1);
     let mut size = vec2(avail.x, avail.x / aspect);
     if size.y > avail.y {
         size = vec2(avail.y * aspect, avail.y);
     }
+    // Show the frame at its own pixel size when it fits (1:1, no second
+    // scaling), e.g. always on Retina, except in low-power mode.
+    let px = vec2(st.preview_px[0] as f32, st.preview_px[1] as f32) / ppp;
+    if px.x > 0.0 && px.x <= avail.x + 0.5 && px.y <= avail.y + 0.5 && !st.settings.preview_low_power {
+        size = px;
+    }
     ui.vertical_centered(|ui| {
         ui.add_space(((avail.y - size.y) / 2.0).max(0.0));
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        // Snap to the pixel grid so texels land on pixels.
+        let rect = egui::Rect::from_min_size(
+            egui::pos2((rect.min.x * ppp).round() / ppp, (rect.min.y * ppp).round() / ppp),
+            rect.size(),
+        );
         let r = CornerRadius::same(10);
         ui.painter().rect_filled(rect, r, Color32::BLACK);
         let live = st.recording.is_some() || st.preview.is_some();
         match &st.preview_tex {
-            Some(t) if live => {
-                egui::Image::new((t.id(), size)).corner_radius(r).paint_at(ui, rect);
+            Some(id) if live => {
+                egui::Image::new((*id, size)).corner_radius(r).paint_at(ui, rect);
             }
             _ => {
                 let msg = if st.finishing { "Saving…" } else { "No preview" };
@@ -694,6 +708,9 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
             ui.add_enabled(s.cursor, egui::Checkbox::new(&mut s.clicks, "Highlight clicks"));
         });
         ui.end_row();
+        ui.label("Preview");
+        ui.checkbox(&mut s.preview_low_power, "Low power (half resolution, 15 fps)");
+        ui.end_row();
     });
 
     section(ui, "AUDIO");
@@ -734,8 +751,34 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
                 [("720p", "720p"), ("1080p", "1080p"), ("1440p", "1440p"), ("4k", "4K")].iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
             combo(ui, "live-res", &mut s.live_resolution, &opts, true);
             ui.end_row();
+            ui.label("Codec");
+            let opts: Vec<(String, String)> = [("auto", "Auto (HEVC for YouTube, else H.264)"), ("h264", "H.264"), ("hevc", "HEVC (falls back to H.264)")]
+                .iter()
+                .map(|(v, l)| (v.to_string(), l.to_string()))
+                .collect();
+            combo(ui, "live-codec", &mut s.stream_codec, &opts, true);
+            ui.end_row();
             ui.label("Video bitrate");
-            ui.add(egui::Slider::new(&mut s.stream_bitrate_kbps, 1000..=20_000).suffix(" kb/s").step_by(500.0));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.stream_bitrate_auto, "Platform preset");
+                if !s.stream_bitrate_auto {
+                    ui.add(egui::Slider::new(&mut s.stream_bitrate_kbps, 1000..=60_000).suffix(" kb/s").step_by(500.0).logarithmic(true));
+                }
+            });
+            ui.end_row();
+            ui.label("");
+            let c = s.live_config();
+            ui.label(
+                RichText::new(format!(
+                    "{}x{} {} at {:.1} Mb/s (never above the recording size)",
+                    c.width,
+                    c.height,
+                    if c.hevc { "HEVC" } else { "H.264" },
+                    c.bitrate as f64 / 1e6
+                ))
+                .size(SECONDARY)
+                .color(theme::pal(ui).secondary),
+            );
             ui.end_row();
             ui.label("Rate control");
             ui.checkbox(&mut s.stream_cbr, "Constant bitrate (CBR)");

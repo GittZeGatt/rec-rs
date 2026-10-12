@@ -48,6 +48,8 @@ pub struct Settings {
     pub mirror: bool,
     pub cursor: bool,
     pub clicks: bool,
+    /// Preview at half resolution and 15 fps.
+    pub preview_low_power: bool,
     /// Keep the last `replay_secs` of the live encode in memory.
     pub replay_enabled: bool,
     pub replay_secs: u32,
@@ -100,6 +102,7 @@ impl Default for Settings {
             mirror: true,
             cursor: true,
             clicks: false,
+            preview_low_power: false,
             replay_enabled: false,
             replay_secs: 60,
             stream_dest: "youtube".into(),
@@ -193,6 +196,7 @@ impl Settings {
             pip_border_color: d.pip_border_color,
             pip_shadow: d.pip_shadow,
             mirror: d.mirror,
+            preview_low_power: d.preview_low_power,
             replay_enabled: d.replay_enabled,
             replay_secs: d.replay_secs,
             stream_dest: d.stream_dest.clone(),

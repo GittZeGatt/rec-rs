@@ -41,7 +41,7 @@ native-tls = "0.2"
 getrandom = "0.3"
 str0m = { version = "0.24", default-features = false, features = ["apple-crypto"] }
 ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
-objc2-metal = "0.3"
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"] }
 objc2-metal-performance-shaders = "0.3"
 
 [profile.release]
