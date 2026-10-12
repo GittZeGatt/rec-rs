@@ -156,6 +156,11 @@ pub struct Session {
     pub description: String,
 }
 
+/// How long a freshly started camera needs before its exposure is close to
+/// settled (measured on a MacBook Pro camera: about 94% of the final
+/// brightness after 1.5 s, 98% after 2 s).
+const CAMERA_SETTLE_SECS: f64 = 2.0;
+
 /// Size ScreenCaptureKit delivers: the native size when it is larger than
 /// the output (scaled down here with a high-quality filter), else the output
 /// size. `REC_SCALER=sck` keeps ScreenCaptureKit's own scaling.
@@ -169,6 +174,19 @@ fn capture_size(o: &Options) -> (usize, usize) {
 impl Session {
     /// Start capturing. `write` false = preview-only (nothing written).
     pub fn start(o: &Options, target: Option<screen::Target>, write: bool, preview: Option<PreviewFn>) -> Result<Session> {
+        Self::start_with_camera(o, target, write, preview, None)
+    }
+
+    /// `start`, taking over a running camera (from `take_camera`) when it is
+    /// the one this session wants: it keeps its settled exposure instead of
+    /// restarting dark. Otherwise it is stopped.
+    pub fn start_with_camera(
+        o: &Options,
+        target: Option<screen::Target>,
+        write: bool,
+        preview: Option<PreviewFn>,
+        cam: Option<Camera>,
+    ) -> Result<Session> {
         let (w, h) = o.size;
         // BGRA for the compositor, and for a window, whose transparent
         // rounded corners are filled before encoding (420v has no alpha).
@@ -218,7 +236,7 @@ impl Session {
             description: String::new(),
         };
         // On any start failure, tear down what was started and remove the file.
-        match sess.start_sources(o, target, pixel_format) {
+        match sess.start_sources(o, target, pixel_format, cam) {
             Ok(()) => {}
             Err(e) => {
                 sess.stop_sources();
@@ -264,10 +282,29 @@ impl Session {
         Ok(sess)
     }
 
-    fn start_sources(&mut self, o: &Options, target: Option<screen::Target>, pixel_format: u32) -> Result<()> {
+    fn start_sources(&mut self, o: &Options, target: Option<screen::Target>, pixel_format: u32, cam: Option<Camera>) -> Result<()> {
         let (w, h) = o.size;
+        let mut cam = cam;
         if let Some(sel) = &o.webcam {
-            self.cam = Some(Camera::start(sel.as_deref(), self.shared.clone())?);
+            let reuse = cam.take_if(|c| Camera::resolve(sel.as_deref()).is_ok_and(|id| id == c.id));
+            let c = match reuse {
+                Some(c) => {
+                    c.retarget(self.shared.clone());
+                    c
+                }
+                None => Camera::start(sel.as_deref(), self.shared.clone())?,
+            };
+            // Start the file once the camera shows a picture and has had
+            // time to settle its exposure, so it doesn't open on black or
+            // dark frames (a preview just shows them).
+            if self.output.is_some() && o.scene.uses_cam() {
+                let settle = (CAMERA_SETTLE_SECS - c.started.elapsed().as_secs_f64()).max(0.0);
+                self.shared.with(|s| s.wait_for_camera(settle));
+            }
+            self.cam = Some(c);
+        }
+        if let Some(c) = cam {
+            c.stop();
         }
         let sck_mic = if o.mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
         if o.mic_backend == MicBackend::Avcapture
@@ -313,6 +350,12 @@ impl Session {
             m.stop();
         }
         err
+    }
+
+    /// Take the camera out of this session, still running, for the next
+    /// one (`start_with_camera`).
+    pub fn take_camera(&mut self) -> Option<Camera> {
+        self.cam.take()
     }
 
     pub fn camera_name(&self) -> Option<&str> {
@@ -501,10 +544,11 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
             }
         }
         let el = sess.started.elapsed().as_secs_f64();
-        // --duration counts recorded time, so pauses extend the wall time.
+        // --duration counts recorded time, so pauses extend the wall time
+        // (and the wait for a camera to settle before the file starts).
         let rec_t = if sess.has_frames() { sess.recorded_secs() } else { 0.0 };
         if let Some(d) = o.duration
-            && (rec_t >= d || (!sess.has_frames() && el >= d))
+            && (rec_t >= d || (!sess.has_frames() && el >= d + CAMERA_SETTLE_SECS + 3.0))
         {
             break;
         }

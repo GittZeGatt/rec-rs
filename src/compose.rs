@@ -699,3 +699,74 @@ mod tests {
         assert!(red(px(13 + 80, 360 - 13 - 80)), "new position: {:?}", px(93, 267));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod color_probe {
+    use super::*;
+    use objc2_core_foundation::CFString;
+    use objc2_core_video::*;
+
+    pub(crate) fn gray(v: u8, tag: Option<(&CFString, &CFString)>) -> CFRetained<CVPixelBuffer> {
+        stripes(64, 36, &[v], tag)
+    }
+
+    /// A BGRA frame of vertical gray stripes, optionally color-tagged.
+    pub(crate) fn stripes(w: usize, h: usize, vals: &[u8], tag: Option<(&CFString, &CFString)>) -> CFRetained<CVPixelBuffer> {
+        let pool = make_pool(w, h, PIX_BGRA);
+        let mut b = std::ptr::null_mut();
+        unsafe {
+            CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut b));
+            let b: CFRetained<CVPixelBuffer> = CFRetained::from_raw(std::ptr::NonNull::new(b).unwrap());
+            CVPixelBufferLockBaseAddress(&b, CVPixelBufferLockFlags(0));
+            let p = CVPixelBufferGetBaseAddress(&b) as *mut u8;
+            let row = CVPixelBufferGetBytesPerRow(&b);
+            for y in 0..h {
+                for x in 0..w {
+                    let v = vals[x * vals.len() / w];
+                    for c in 0..4 {
+                        *p.add(y * row + x * 4 + c) = if c == 3 { 255 } else { v };
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&b, CVPixelBufferLockFlags(0));
+            if let Some((prim, tf)) = tag {
+                let m = CVAttachmentMode::ShouldPropagate;
+                b.set_attachment(kCVImageBufferColorPrimariesKey, prim.as_ref(), m);
+                b.set_attachment(kCVImageBufferTransferFunctionKey, tf.as_ref(), m);
+            }
+            b
+        }
+    }
+
+    fn center(b: &CVPixelBuffer) -> u8 {
+        unsafe {
+            CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags(1));
+            let p = CVPixelBufferGetBaseAddress(b) as *const u8;
+            let v = *p.add(CVPixelBufferGetBytesPerRow(b) * 18 + 32 * 4 + 1);
+            CVPixelBufferUnlockBaseAddress(b, CVPixelBufferLockFlags(1));
+            v
+        }
+    }
+
+    /// Camera-style frames through the compositor (run with --ignored).
+    #[test]
+    #[ignore]
+    fn camera_tags() {
+        let out = gray(0, None);
+        let mut c = Compositor::new(64, 36, PipSpec::default());
+        unsafe {
+            for (name, tag) in [
+                ("untagged", None),
+                ("709/709", Some((kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2))),
+                ("709/sRGB", Some((kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_sRGB))),
+            ] {
+                let vals: Vec<u8> = [32u8, 64, 128, 192].iter().map(|&v| {
+                    let cam = gray(v, tag);
+                    c.render(Scene::Cam, None, Some(&cam), &out);
+                    center(&out)
+                }).collect();
+                println!("{name}: in [32, 64, 128, 192] -> {vals:?}");
+            }
+        }
+    }
+}

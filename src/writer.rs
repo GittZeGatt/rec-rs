@@ -187,6 +187,19 @@ type Pb = SendBox<CFRetained<CVPixelBuffer>>;
 pub type PreviewFn = std::sync::Arc<dyn Fn(CFRetained<CVPixelBuffer>) + Send + Sync>;
 
 /// The file being written (absent for preview-only sessions).
+/// See `Sink::wait_for_camera`.
+struct CamGate {
+    settle: f64,
+    /// The newest screen frame held back meanwhile.
+    pending: Option<Pb>,
+    /// Host time the camera is ready (first frame + settle).
+    ready_at: Option<f64>,
+    give_up: f64,
+}
+
+/// Start without the camera if it delivers nothing for this long.
+const CAMERA_TIMEOUT_SECS: f64 = 3.0;
+
 struct Out {
     writer: Retained<AVAssetWriter>,
     video: Retained<AVAssetWriterInput>,
@@ -234,6 +247,8 @@ pub struct Sink {
     scaler: Option<crate::scale::FrameScaler>,
     /// Fills a window capture's transparent corners (see `CornerFill`).
     corner_fill: Option<crate::compose::CornerFill>,
+    /// Hold the start until the camera is ready (see `wait_for_camera`).
+    cam_gate: Option<CamGate>,
     /// Output-size buffers for scaled screen frames fed to the compositor.
     scaled_pool: Option<CFRetained<CVPixelBufferPool>>,
     /// Output size and pixel format (for a pool created later).
@@ -360,6 +375,7 @@ impl Sink {
             compositor,
             scaler: None,
             corner_fill: None,
+            cam_gate: None,
             scaled_pool: None,
             out_spec: (v.width, v.height, v.pixel_format),
             stats: Stats::default(),
@@ -458,6 +474,14 @@ impl Sink {
         self.scaler = Some(scaler);
     }
 
+    /// Start only once the camera has delivered a frame and then run for
+    /// `settle` seconds (its exposure settling). Gives up after a few
+    /// seconds without camera frames rather than never starting.
+    pub fn wait_for_camera(&mut self, settle: f64) {
+        let now = secs(host_now());
+        self.cam_gate = Some(CamGate { settle, pending: None, ready_at: None, give_up: now + settle + CAMERA_TIMEOUT_SECS });
+    }
+
     /// Screen frames are a single window's: fill its transparent corners.
     pub fn fill_window_corners(&mut self) {
         self.corner_fill = Some(crate::compose::CornerFill::new());
@@ -498,6 +522,18 @@ impl Sink {
 
     pub fn push_screen(&mut self, pts: CMTime, pb: CFRetained<CVPixelBuffer>) {
         self.stats.screen_frames_in += 1;
+        if self.t0.is_none()
+            && let Some(g) = &mut self.cam_gate
+        {
+            let now = secs(pts);
+            if g.ready_at.is_none_or(|r| now < r) && now < g.give_up {
+                // Kept: a still screen sends no more frames, so this one
+                // starts the file when the camera is ready.
+                g.pending = Some(SendBox(pb));
+                return;
+            }
+            self.cam_gate = None;
+        }
         let pts_s = secs(pts);
         let lat = secs(host_now()) - pts_s;
         self.stats.screen_latency_max = self.stats.screen_latency_max.max(lat);
@@ -530,6 +566,16 @@ impl Sink {
 
     pub fn push_cam(&mut self, pts: CMTime, pb: CFRetained<CVPixelBuffer>) {
         self.stats.cam_frames_in += 1;
+        if let Some(g) = &mut self.cam_gate {
+            let ready = *g.ready_at.get_or_insert(secs(pts) + g.settle);
+            if secs(pts) >= ready.min(g.give_up)
+                && let Some(screen) = g.pending.take()
+            {
+                // The waiting screen frame starts the file now.
+                self.cam_gate = None;
+                self.push_screen(pts, screen.0);
+            }
+        }
         let lat = secs(host_now()) - secs(pts);
         self.stats.cam_latency_max = self.stats.cam_latency_max.max(lat);
         self.note_latency(1, lat, secs(pts));
@@ -1075,6 +1121,66 @@ fn err_text(w: &AVAssetWriter) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Color levels through the encoder for BGRA frames untagged, tagged
+    /// sRGB (the encoder converts those to the BT.709 curve: darker
+    /// midtones) and BT.709 (a camera's tags). PROBE_CAM=1 sends them
+    /// through the compositor as the camera first, PROBE_SCREEN=1 as the
+    /// screen. Run with --ignored --nocapture; prints decoded levels.
+    #[test]
+    #[ignore]
+    fn bgra_encode_levels() {
+        use objc2_core_video::*;
+        let vals = [32u8, 64, 128, 192, 235];
+        let dir = std::env::temp_dir();
+        unsafe {
+            for (name, tag) in [
+                ("untagged", None),
+                ("sRGB", Some((kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_sRGB))),
+                ("709", Some((kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2))),
+            ] {
+                let path = dir.join(format!("rec-probe-{name}.mov"));
+                let _ = std::fs::remove_file(&path);
+                let spec = super::VideoSpec { width: 320, height: 64, fps: 30, codec: crate::writer::Codec::H264, bitrate: 20_000_000, pixel_format: crate::util::PIX_BGRA };
+                let o = super::open_output(&path, &spec, false, false, super::AudioLayout::Both).unwrap();
+                o.writer.startSessionAtSourceTime(objc2_core_media::CMTime::new(0, 30));
+                let src = crate::compose::color_probe::stripes(320, 64, &vals, tag);
+                // Through the compositor as the camera (full frame) or as is.
+                let f = if std::env::var_os("PROBE_CAM").is_some() {
+                    let out = crate::compose::color_probe::stripes(320, 64, &[0], None);
+                    let pip = crate::compose::PipSpec { mirror: false, ..Default::default() };
+                    crate::compose::Compositor::new(320, 64, pip).render(crate::compose::Scene::Cam, None, Some(&src), &out);
+                    let tf = out.attachment(kCVImageBufferTransferFunctionKey, std::ptr::null_mut());
+                    println!("compositor output transfer tag: {:?}", tf);
+                    out
+                } else if std::env::var_os("PROBE_SCREEN").is_some() {
+                    let out = crate::compose::color_probe::stripes(320, 64, &[0], None);
+                    crate::compose::Compositor::new(320, 64, Default::default()).render(crate::compose::Scene::Screen, Some(&src), None, &out);
+                    out
+                } else {
+                    src
+                };
+                for i in 0..10 {
+                    while !o.video.isReadyForMoreMediaData() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    assert!(o.adaptor.appendPixelBuffer_withPresentationTime(&f, objc2_core_media::CMTime::new(i, 30)));
+                }
+                o.video.markAsFinished();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let block = block2::RcBlock::new(move || { let _ = tx.send(()); });
+                o.writer.finishWritingWithCompletionHandler(&block);
+                rx.recv().unwrap();
+                let out = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"]).arg(&path)
+                    .args(["-frames:v", "1", "-vf", "extractplanes=y", "-f", "rawvideo", "-"])
+                    .output().unwrap().stdout;
+                let ys: Vec<u8> = (0..vals.len()).map(|i| out[32 * 320 + i * 64 + 32]).collect();
+                println!("{name}: rgb {vals:?} -> Y {ys:?} (full-range equivalent of BT.709 limited: {:?})",
+                    vals.iter().map(|&v| 16 + (v as u32 * 219 + 127) / 255).collect::<Vec<_>>());
+            }
+        }
+    }
+
     use super::Pauses;
 
     #[test]

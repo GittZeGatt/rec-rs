@@ -77,7 +77,8 @@ pub fn resolve_mic(sel: &str) -> Result<String> {
 }
 
 pub struct CamIvars {
-    shared: Arc<Shared>,
+    /// Where frames go; switched when the camera moves to another session.
+    shared: std::sync::Mutex<Arc<Shared>>,
 }
 
 define_class!(
@@ -93,8 +94,17 @@ define_class!(
         unsafe fn did_output(&self, _o: &AVCaptureOutput, sb: &CMSampleBuffer, _c: &AVCaptureConnection) {
             unsafe {
                 if let Some(pb) = sb.image_buffer() {
+                    // REC_DEBUG: the camera's color tags (once).
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    if std::env::var_os("REC_DEBUG").is_some() {
+                        LOGGED.call_once(|| {
+                            let a = pb.attachments(objc2_core_video::CVAttachmentMode::ShouldPropagate);
+                            eprintln!("rec: debug: camera frame attachments: {a:?}");
+                        });
+                    }
                     let pts = sb.presentation_time_stamp();
-                    self.ivars().shared.with(|s| s.push_cam(pts, pb));
+                    let shared = self.ivars().shared.lock().unwrap().clone();
+                    shared.with(|s| s.push_cam(pts, pb));
                 }
             }
         }
@@ -103,18 +113,24 @@ define_class!(
 
 pub struct Camera {
     session: Retained<AVCaptureSession>,
-    _out: Retained<CameraOutput>,
+    out: Retained<CameraOutput>,
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
     pub name: String,
+    /// The device's unique ID.
+    pub id: String,
+    /// When it started: auto-exposure and white balance settle over the
+    /// first second or two, so a fresh camera looks dark at first.
+    pub started: std::time::Instant,
 }
 
 unsafe impl Send for Camera {}
 
 impl Camera {
-    /// `sel`: None = first camera, else unique ID or name substring.
-    pub fn start(sel: Option<&str>, shared: Arc<Shared>) -> Result<Self> {
+    /// The device `sel` names: None = the system's preferred camera, else a
+    /// unique ID or name substring.
+    fn device(sel: Option<&str>) -> Result<Retained<AVCaptureDevice>> {
         let cams = cameras_raw();
-        let dev = match sel {
+        match sel {
             // System-preferred camera (what FaceTime would use), else the
             // built-in camera, else anything.
             None => unsafe { AVCaptureDevice::systemPreferredCamera() }
@@ -131,7 +147,23 @@ impl Camera {
                 })
             }
         }
-        .ok_or_else(|| anyhow!("no camera found (see `rec-rs devices`)"))?;
+        .ok_or_else(|| anyhow!("no camera found (see `rec-rs devices`)"))
+    }
+
+    /// The unique ID of the camera `sel` names (see `device`).
+    pub fn resolve(sel: Option<&str>) -> Result<String> {
+        Ok(unsafe { Self::device(sel)?.uniqueID().to_string() })
+    }
+
+    /// Send frames to another session's sink (the camera keeps running,
+    /// already exposed, instead of restarting).
+    pub fn retarget(&self, shared: Arc<Shared>) {
+        *self.out.ivars().shared.lock().unwrap() = shared;
+    }
+
+    /// `sel`: None = first camera, else unique ID or name substring.
+    pub fn start(sel: Option<&str>, shared: Arc<Shared>) -> Result<Self> {
+        let dev = Self::device(sel)?;
         unsafe {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
@@ -165,12 +197,13 @@ impl Camera {
             if !session.isRunning() {
                 bail!("camera {name} failed to start");
             }
-            Ok(Camera { session, _out: delegate, _queue: queue, name })
+            let id = dev.uniqueID().to_string();
+            Ok(Camera { session, out: delegate, _queue: queue, name, id, started: std::time::Instant::now() })
         }
     }
 
     fn make_delegate(shared: Arc<Shared>) -> Retained<CameraOutput> {
-        let this = CameraOutput::alloc().set_ivars(CamIvars { shared });
+        let this = CameraOutput::alloc().set_ivars(CamIvars { shared: std::sync::Mutex::new(shared) });
         unsafe { msg_send![super(this), init] }
     }
 
