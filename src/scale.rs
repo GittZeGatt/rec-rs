@@ -45,6 +45,17 @@ pub struct FrameScaler {
 // lock.
 unsafe impl Send for FrameScaler {}
 
+/// Tag a buffer BT.709 (what the encoders declare).
+#[cfg(test)]
+pub fn tag_bt709(buf: &CVPixelBuffer) {
+    unsafe {
+        let mode = CVAttachmentMode::ShouldPropagate;
+        buf.set_attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2.as_ref(), mode);
+        buf.set_attachment(kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2.as_ref(), mode);
+        buf.set_attachment(kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2.as_ref(), mode);
+    }
+}
+
 fn set(session: &VTPixelTransferSession, key: &CFString, value: &CFString) {
     unsafe {
         VTSessionSetProperty(session.as_ref(), key, Some(value.as_ref() as &CFType));

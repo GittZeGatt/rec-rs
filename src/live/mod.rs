@@ -36,11 +36,13 @@ pub struct LiveConfig {
     pub cbr: bool,
     /// AAC bits per second (Opus for WHIP uses the same).
     pub audio_bitrate: u32,
+    /// Prefer HEVC (used when every stream accepts it, else H.264).
+    pub hevc: bool,
 }
 
 impl Default for LiveConfig {
     fn default() -> Self {
-        LiveConfig { width: 1920, height: 1080, bitrate: 6_000_000, keyframe_secs: 1.0, cbr: true, audio_bitrate: 160_000 }
+        LiveConfig { width: 1920, height: 1080, bitrate: 6_000_000, keyframe_secs: 2.0, cbr: true, audio_bitrate: 160_000, hevc: false }
     }
 }
 
@@ -53,8 +55,12 @@ pub enum Packet {
 /// Codec configuration the outputs need (sequence headers).
 #[derive(Clone, Default)]
 pub struct Formats {
-    pub sps: Vec<u8>,
-    pub pps: Vec<u8>,
+    /// The current video is HEVC (else H.264).
+    pub hevc: bool,
+    /// Parameter set NAL units (SPS/PPS, or VPS/SPS/PPS for HEVC).
+    pub param_sets: Vec<Vec<u8>>,
+    /// Decoder configuration record (`avcC` / `hvcC`).
+    pub record: Vec<u8>,
     pub aac_cookie: Vec<u8>,
 }
 
@@ -64,6 +70,10 @@ pub trait Output: Send {
     fn status(&self) -> OutputStatus;
     /// Wants Opus audio (WebRTC) instead of AAC.
     fn wants_opus(&self) -> bool {
+        false
+    }
+    /// Can take HEVC (otherwise the shared encode uses H.264).
+    fn accepts_hevc(&self) -> bool {
         false
     }
     /// Asked for a keyframe (just connected or reconnected).
@@ -99,11 +109,12 @@ impl Hub {
         match &p {
             Packet::Video(v) => {
                 if v.key
-                    && self.formats.sps.is_empty()
-                    && let Some((sps, pps)) = video::parameter_sets(&v.format.0)
+                    && (self.formats.param_sets.is_empty() || self.formats.hevc != v.hevc)
+                    && let Some(sets) = video::parameter_sets(&v.format.0)
                 {
-                    self.formats.sps = sps;
-                    self.formats.pps = pps;
+                    self.formats.hevc = v.hevc;
+                    self.formats.param_sets = sets;
+                    self.formats.record = video::config_record(&v.format.0).unwrap_or_default();
                 }
                 if let Some(r) = &mut self.replay {
                     r.push_video(v.clone());
@@ -139,6 +150,17 @@ struct Encoders {
     last_frame: Option<(f64, crate::util::SendBox<objc2_core_foundation::CFRetained<CVPixelBuffer>>)>,
     /// End time of the audio encoded so far; short gaps get silence.
     audio_end: Option<f64>,
+    /// Scaler to the encode size, its output pool and (width, height,
+    /// pixel format).
+    scaler: Option<(crate::scale::FrameScaler, crate::util::SendBox<objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBufferPool>>, (usize, usize, u32))>,
+}
+
+/// Encode size: the frame fitted into the configured size, never larger
+/// than the frame (no upscaling), even dimensions.
+fn enc_size(cfg: &LiveConfig, frame: &CVPixelBuffer) -> (usize, usize) {
+    let (fw, fh) = (CVPixelBufferGetWidth(frame) as f64, CVPixelBufferGetHeight(frame) as f64);
+    let s = (cfg.width as f64 / fw).min(cfg.height as f64 / fh).min(1.0);
+    (((fw * s).round() as usize).max(16) & !1, ((fh * s).round() as usize).max(16) & !1)
 }
 
 /// Gaps up to this long are filled (repeated frame, silence); longer ones
@@ -171,6 +193,7 @@ impl Default for Live {
                 creating: false,
                 last_frame: None,
                 audio_end: None,
+                scaler: None,
             }),
             made: Arc::default(),
             cfg: Mutex::new(LiveConfig::default()),
@@ -248,20 +271,31 @@ impl Live {
             return;
         }
         let cfg = self.config();
-        let want_key = self.hub.lock().unwrap().outputs.iter_mut().fold(false, |k, (_, o)| o.take_keyframe_request() | k);
+        let (want_key, hevc) = {
+            let mut hub = self.hub.lock().unwrap();
+            let key = hub.outputs.iter_mut().fold(false, |k, (_, o)| o.take_keyframe_request() | k);
+            (key, cfg.hevc && hub.outputs.iter().all(|(_, o)| o.accepts_hevc()))
+        };
         let mut e = self.enc.lock().unwrap();
+        if e.video.as_ref().is_some_and(|v| v.cfg.hevc != hevc) {
+            // An output can't take HEVC (or can again): switch codec.
+            e.video = None;
+            self.made.lock().unwrap().take();
+            e.creating = false;
+        }
         if e.video.as_ref().is_none_or(|v| v.cfg.fps != fps) {
             // Creating a hardware session takes ~100 ms: do it off the
             // capture path (frames until then are skipped).
             if !e.creating {
                 e.creating = true;
                 let vc = VideoConfig {
-                    width: cfg.width.min(CVPixelBufferGetWidth(frame)).max(16) & !1,
-                    height: cfg.height.min(CVPixelBufferGetHeight(frame)).max(16) & !1,
+                    width: enc_size(&cfg, frame).0,
+                    height: enc_size(&cfg, frame).1,
                     fps,
                     bitrate: cfg.bitrate,
                     keyframe_secs: cfg.keyframe_secs,
                     cbr: cfg.cbr,
+                    hevc,
                 };
                 let hub = self.hub.clone();
                 let made = self.made.clone();
@@ -272,7 +306,7 @@ impl Live {
             }
             let ready = self.made.lock().unwrap().take();
             match ready {
-                Some(Ok(v)) if v.cfg.fps == fps => {
+                Some(Ok(v)) if v.cfg.fps == fps && v.cfg.hevc == hevc => {
                     e.video = Some(v);
                     e.creating = false;
                 }
@@ -286,6 +320,25 @@ impl Live {
             }
         }
         let last = e.last_frame.take();
+        // A smaller live encode than the capture: scale with the same
+        // Lanczos scaler as the recording, not inside the encoder.
+        let size = e.video.as_ref().map(|v| (v.cfg.width, v.cfg.height));
+        let scaled = size.and_then(|sz| {
+            if (CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame)) == sz {
+                return None;
+            }
+            let fmt = objc2_core_video::CVPixelBufferGetPixelFormatType(frame);
+            if e.scaler.as_ref().is_none_or(|s| s.2 != (sz.0, sz.1, fmt)) {
+                let sc = crate::scale::FrameScaler::new(sz.0, sz.1)?;
+                e.scaler = Some((sc, crate::util::SendBox(crate::util::make_pool(sz.0, sz.1, fmt)), (sz.0, sz.1, fmt)));
+            }
+            let (sc, pool, _) = e.scaler.as_mut()?;
+            let mut buf = std::ptr::null_mut();
+            unsafe { objc2_core_video::CVPixelBufferPool::create_pixel_buffer(None, &pool.0, std::ptr::NonNull::from(&mut buf)) };
+            let out: objc2_core_foundation::CFRetained<CVPixelBuffer> = unsafe { objc2_core_foundation::CFRetained::from_raw(std::ptr::NonNull::new(buf)?) };
+            sc.scale(frame, &out).then_some(out)
+        });
+        let frame: &CVPixelBuffer = scaled.as_deref().unwrap_or(frame);
         if let Some(v) = e.video.as_mut() {
             if want_key {
                 v.force_keyframe();
@@ -492,6 +545,47 @@ pub fn destination_url(dest: &str) -> String {
     }
 }
 
+/// A streaming platform, recognized from the ingest URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Platform {
+    YouTube,
+    Twitch,
+    Other,
+}
+
+pub fn platform(url: &str) -> Platform {
+    let host = url.split("://").nth(1).unwrap_or(url).split(['/', ':']).next().unwrap_or("").to_lowercase();
+    if host.ends_with("youtube.com") {
+        Platform::YouTube
+    } else if host.ends_with("twitch.tv") || host.ends_with("contribute.live-video.net") {
+        Platform::Twitch
+    } else {
+        Platform::Other
+    }
+}
+
+/// Encode limits and the recommended video bitrate (kb/s) for a platform
+/// at an encode height and frame rate:
+/// - YouTube (its live encoder settings): H.264 2160p60 45 Mb/s, 2160p30
+///   35, 1440p 24/16, 1080p 12/10, 720p 7.5/5; HEVC (enhanced RTMP) about
+///   a quarter less (2160p 35/25 Mb/s).
+/// - Twitch: H.264 only, at most 1080p60 and 6 Mb/s (its ingest limits).
+pub fn preset(p: Platform, height: usize, fps: u32, hevc: bool) -> (u32, usize, bool) {
+    // [H.264 60 fps, H.264 30 fps, HEVC 60 fps, HEVC 30 fps]
+    let row = match height {
+        h if h > 1440 => [45_000, 35_000, 35_000, 25_000],
+        h if h > 1080 => [24_000, 16_000, 18_000, 12_000],
+        h if h > 720 => [12_000, 10_000, 9_000, 7_500],
+        _ => [7_500, 5_000, 5_500, 3_500],
+    };
+    let i = usize::from(fps <= 30);
+    match p {
+        Platform::Twitch => (row[i].min(6_000), height.min(1080), false),
+        _ if hevc => (row[2 + i], height, true),
+        _ => (row[i], height, false),
+    }
+}
+
 /// (URL, key) for a destination: the key comes from $REC_STREAM_KEY or the
 /// Keychain. WHIP endpoints may have no key.
 pub fn resolve_destination(dest: &str) -> Result<(String, String)> {
@@ -575,6 +669,19 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
+    }
+
+    #[test]
+    fn platform_presets() {
+        assert_eq!(platform("rtmps://a.rtmps.youtube.com:443/live2"), Platform::YouTube);
+        assert_eq!(platform("rtmps://live.twitch.tv:443/app"), Platform::Twitch);
+        assert_eq!(platform("rtmp://localhost/live"), Platform::Other);
+        // YouTube 4K: 30-50 Mb/s at 60 fps, 20-40 at 30, HEVC lower.
+        assert_eq!(preset(Platform::YouTube, 2160, 60, false), (45_000, 2160, false));
+        assert_eq!(preset(Platform::YouTube, 2160, 30, true), (25_000, 2160, true));
+        assert_eq!(preset(Platform::YouTube, 1080, 60, false).0, 12_000);
+        // Twitch: H.264, at most 1080p and 6 Mb/s.
+        assert_eq!(preset(Platform::Twitch, 2160, 60, true), (6_000, 1080, false));
     }
 
     /// Records every packet's (is video, pts).

@@ -210,9 +210,16 @@ pub struct RecordArgs {
     /// Live encode (replay and streams) size.
     #[arg(long, default_value = "1080p")]
     live_resolution: String,
-    /// Live video bitrate in kb/s.
-    #[arg(long, default_value_t = 6000)]
-    stream_bitrate: u32,
+    /// Live video bitrate in kb/s. Default: the platform's recommendation
+    /// for the size and frame rate (YouTube 4K60 45 Mb/s H.264 or 35 HEVC,
+    /// Twitch at most 6 Mb/s), else YouTube's.
+    #[arg(long)]
+    stream_bitrate: Option<u32>,
+    /// Live video codec: auto (HEVC when every destination is YouTube),
+    /// h264 or hevc (enhanced RTMP / WHIP H.265; falls back to H.264 for
+    /// servers that refuse it).
+    #[arg(long, default_value = "auto", value_parser = ["auto", "h264", "hevc"])]
+    stream_codec: String,
     /// Live keyframe interval in seconds.
     #[arg(long, default_value_t = 2.0)]
     keyframe: f64,
@@ -441,14 +448,39 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
     if a.replay.is_some() || !a.stream.is_empty() {
         let live = live::Live::new();
         let (lw, lh) = parse_size(&a.live_resolution, (w, h), false)?;
+        let urls: Vec<String> = a.stream.iter().map(|d| live::destination_url(d)).collect();
+        let platforms: Vec<live::Platform> = urls.iter().map(|u| live::platform(u)).collect();
+        let want_hevc = match a.stream_codec.as_str() {
+            "hevc" => true,
+            "h264" => false,
+            _ => !platforms.is_empty() && platforms.iter().all(|p| *p == live::Platform::YouTube),
+        };
+        // Every destination's limits: the smallest bitrate and size, HEVC
+        // only if all of them take it.
+        let presets: Vec<(u32, usize, bool)> = if platforms.is_empty() { vec![live::preset(live::Platform::Other, lh.min(h), a.fps.min(60), want_hevc)] } else {
+            platforms.iter().map(|p| live::preset(*p, lh.min(h), a.fps.min(60), want_hevc)).collect()
+        };
+        let kbps = a.stream_bitrate.unwrap_or_else(|| presets.iter().map(|p| p.0).min().unwrap_or(6000));
+        let max_h = presets.iter().map(|p| p.1).min().unwrap_or(lh);
+        let hevc = presets.iter().all(|p| p.2);
+        let (lw, lh) = if lh.min(h) > max_h { (max_h * 16 / 9, max_h) } else { (lw.min(w), lh.min(h)) };
         live.set_config(live::LiveConfig {
-            width: lw.min(w),
-            height: lh.min(h),
-            bitrate: a.stream_bitrate.clamp(500, 50_000) as u64 * 1000,
+            width: lw,
+            height: lh,
+            bitrate: kbps.clamp(500, 80_000) as u64 * 1000,
             keyframe_secs: a.keyframe.clamp(0.5, 4.0),
             cbr: !a.vbr,
             audio_bitrate: a.audio_bitrate.clamp(64, 320) * 1000,
+            hevc,
         });
+        if !a.quiet {
+            eprintln!(
+                "rec: live encode {lw}x{lh} {} {:.1} Mb/s, keyframe every {} s",
+                if hevc { "HEVC" } else { "H.264" },
+                kbps as f64 / 1000.0,
+                a.keyframe
+            );
+        }
         if let Some(secs) = a.replay {
             if !(15.0..=300.0).contains(&secs) {
                 bail!("--replay must be 15-300 seconds");

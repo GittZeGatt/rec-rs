@@ -31,7 +31,7 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_QUEUE_SECS: f64 = 2.0;
 
 enum Media {
-    Video { pts: f64, annexb: Vec<u8> },
+    Video { pts: f64, hevc: bool, annexb: Vec<u8> },
     Audio { pts: f64, data: Arc<Vec<u8>> },
 }
 
@@ -56,6 +56,8 @@ struct Shared {
     samples: VecDeque<(Instant, u64)>,
     want_key: bool,
     skip_to_key: bool,
+    /// The server negotiated H.265 (None until it answers).
+    hevc: Option<bool>,
 }
 
 pub struct WhipOutput {
@@ -107,14 +109,18 @@ impl Output for WhipOutput {
                     return;
                 }
                 let mut annexb = Vec::with_capacity(v.data.len() + 64);
-                if v.key && !f.sps.is_empty() {
-                    for ps in [&f.sps, &f.pps] {
+                if v.hevc && s.hevc == Some(false) {
+                    // Not negotiated: the encoder is switching to H.264.
+                    return;
+                }
+                if v.key && f.hevc == v.hevc {
+                    for ps in &f.param_sets {
                         annexb.extend_from_slice(&[0, 0, 0, 1]);
                         annexb.extend_from_slice(ps);
                     }
                 }
                 annexb.extend_from_slice(&super::video::avcc_to_annexb(&v.data));
-                s.queue.push_back(Media::Video { pts: v.pts, annexb });
+                s.queue.push_back(Media::Video { pts: v.pts, hevc: v.hevc, annexb });
             }
             Packet::Audio(a) => {
                 if a.codec != AudioCodec::Opus || !s.live || s.queue.len() > 4000 {
@@ -146,6 +152,10 @@ impl Output for WhipOutput {
 
     fn wants_opus(&self) -> bool {
         true
+    }
+
+    fn accepts_hevc(&self) -> bool {
+        self.shared.0.lock().unwrap().hevc != Some(false)
     }
 
     fn take_keyframe_request(&mut self) -> bool {
@@ -278,7 +288,8 @@ fn bind_socket(url: &HttpUrl) -> Result<UdpSocket> {
 struct Session {
     rtc: Rtc,
     socket: UdpSocket,
-    video: (Mid, Pt),
+    /// Video mid with the H.264 and (if negotiated) H.265 payload types.
+    video: (Mid, Pt, Option<Pt>),
     audio: (Mid, Pt),
     resource: Option<String>,
     sent: u64,
@@ -295,6 +306,7 @@ impl Session {
         let mut rtc = Rtc::builder()
             .clear_codecs()
             .enable_h264(true)
+            .enable_h265(true)
             .enable_opus(true, false)
             .build(Instant::now());
         rtc.add_local_candidate(Candidate::host(socket.local_addr()?, "udp")?);
@@ -306,7 +318,7 @@ impl Session {
         let (answer, resource) = post_offer(url, key, &offer.to_sdp_string())?;
         let answer = SdpAnswer::from_sdp_string(&answer).map_err(|e| anyhow!("WHIP answer: {e}"))?;
         rtc.sdp_api().accept_answer(pending, answer).map_err(|e| anyhow!("WHIP answer: {e}"))?;
-        let video = (vmid, pick_pt(&mut rtc, vmid, Codec::H264)?);
+        let video = (vmid, pick_pt(&mut rtc, vmid, Codec::H264)?, pick_pt(&mut rtc, vmid, Codec::H265).ok());
         let audio = (amid, pick_pt(&mut rtc, amid, Codec::Opus)?);
         Ok(Session { rtc, socket, video, audio, resource, sent: 0, send_errors: 0, written: 0, last_rx: Instant::now() })
     }
@@ -503,6 +515,7 @@ fn take_due(q: &mut VecDeque<Media>, anchor: &mut Option<Anchor>, now: Instant) 
 /// Run one connected session until it fails or the output stops.
 fn stream(sess: &mut Session, shared: &Arc<(Mutex<Shared>, Condvar)>, stop: &AtomicBool, backoff: &mut u64) -> Result<()> {
     let (lock, _) = &**shared;
+    lock.lock().unwrap().hevc = Some(sess.video.2.is_some());
     let mut buf = vec![0u8; 2000];
     let mut events = Vec::new();
     let opened = Instant::now();
@@ -550,11 +563,12 @@ fn stream(sess: &mut Session, shared: &Arc<(Mutex<Shared>, Condvar)>, stop: &Ato
                 eprintln!("whip: first {} pts {pts:.4} late {:.1} ms", if matches!(m, Media::Audio { .. }) { "audio" } else { "video" }, (now - wallclock).as_secs_f64() * 1000.0);
             }
             match m {
-                Media::Video { annexb, .. } => {
+                Media::Video { annexb, hevc, .. } => {
                     let rtp = MediaTime::new((rtp_secs * 90_000.0).round() as u64, str0m::media::Frequency::NINETY_KHZ);
                     sess.written += annexb.len() as u64;
-                    if let Some(w) = sess.rtc.writer(sess.video.0) {
-                        w.write(sess.video.1, wallclock, rtp, annexb)?;
+                    let pt = if hevc { sess.video.2 } else { Some(sess.video.1) };
+                    if let (Some(pt), Some(w)) = (pt, sess.rtc.writer(sess.video.0)) {
+                        w.write(pt, wallclock, rtp, annexb)?;
                     }
                 }
                 Media::Audio { data, .. } => {
@@ -601,7 +615,7 @@ mod tests {
     }
 
     fn video(pts: f64) -> Media {
-        Media::Video { pts, annexb: vec![0, 0, 0, 1, 0x65] }
+        Media::Video { pts, hevc: false, annexb: vec![0, 0, 0, 1, 0x65] }
     }
 
     fn audio(pts: f64) -> Media {

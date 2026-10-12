@@ -58,6 +58,11 @@ pub struct Settings {
     /// Live encode (replay buffer and streams).
     pub live_resolution: String,
     pub stream_bitrate_kbps: u32,
+    /// Use the platform's recommended bitrate (`live::preset`) instead of
+    /// `stream_bitrate_kbps`.
+    pub stream_bitrate_auto: bool,
+    /// "auto" (HEVC for YouTube, else H.264), "h264" or "hevc".
+    pub stream_codec: String,
     pub keyframe_secs: f64,
     pub stream_cbr: bool,
     pub stream_audio_kbps: u32,
@@ -101,6 +106,8 @@ impl Default for Settings {
             stream_custom_url: String::new(),
             live_resolution: "1080p".into(),
             stream_bitrate_kbps: 6000,
+            stream_bitrate_auto: true,
+            stream_codec: "auto".into(),
             keyframe_secs: 2.0,
             stream_cbr: true,
             stream_audio_kbps: 160,
@@ -192,6 +199,8 @@ impl Settings {
             stream_custom_url: d.stream_custom_url.clone(),
             live_resolution: d.live_resolution.clone(),
             stream_bitrate_kbps: d.stream_bitrate_kbps,
+            stream_bitrate_auto: d.stream_bitrate_auto,
+            stream_codec: d.stream_codec.clone(),
             keyframe_secs: d.keyframe_secs,
             stream_cbr: d.stream_cbr,
             stream_audio_kbps: d.stream_audio_kbps,
@@ -209,21 +218,32 @@ impl Settings {
     }
 
     /// The live encode these settings describe (sizes above the capture
-    /// are clamped to it by the encoder).
+    /// are clamped to it by the encoder): the platform's limits, codec and
+    /// recommended bitrate unless set by hand.
     pub fn live_config(&self) -> crate::live::LiveConfig {
-        let (width, height) = match self.live_resolution.as_str() {
-            "720p" => (1280, 720),
-            "1440p" => (2560, 1440),
-            "4k" => (3840, 2160),
-            _ => (1920, 1080),
+        use crate::live::{Platform, platform, preset};
+        let height = match self.live_resolution.as_str() {
+            "720p" => 720,
+            "1440p" => 1440,
+            "4k" => 2160,
+            _ => 1080,
         };
+        let p = platform(&self.stream_url());
+        let hevc = match self.stream_codec.as_str() {
+            "hevc" => true,
+            "h264" => false,
+            _ => p == Platform::YouTube,
+        };
+        let (kbps, height, hevc) = preset(p, height, self.fps.min(60), hevc);
+        let bitrate = if self.stream_bitrate_auto { kbps } else { self.stream_bitrate_kbps.clamp(500, 80_000) };
         crate::live::LiveConfig {
-            width,
+            width: height * 16 / 9,
             height,
-            bitrate: self.stream_bitrate_kbps.clamp(500, 50_000) as u64 * 1000,
+            bitrate: bitrate as u64 * 1000,
             keyframe_secs: self.keyframe_secs.clamp(0.5, 4.0),
             cbr: self.stream_cbr,
             audio_bitrate: self.stream_audio_kbps.clamp(64, 320) * 1000,
+            hevc,
         }
     }
 

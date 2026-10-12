@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::audio::{AAC_ASC, AudioCodec};
-use super::video::avcc_record;
 use super::{Formats, Output, OutputStatus, Packet};
 
 // ---------------------------------------------------------------- AMF0
@@ -26,6 +25,7 @@ pub enum Amf {
     Null,
     Undefined,
     Ecma(Vec<(String, Amf)>),
+    Array(Vec<Amf>),
 }
 
 impl Amf {
@@ -60,6 +60,13 @@ impl Amf {
                 out.extend_from_slice(&(kv.len() as u32).to_be_bytes());
                 props(out, kv);
             }
+            Amf::Array(items) => {
+                out.push(0x0A);
+                out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+                for v in items {
+                    v.encode(out);
+                }
+            }
         }
     }
 
@@ -92,6 +99,16 @@ impl Amf {
             5 => Some((Amf::Null, 1)),
             6 => Some((Amf::Undefined, 1)),
             8 => props(&b[5..]).map(|(kv, n)| (Amf::Ecma(kv), 5 + n)),
+            0x0A => {
+                let n = u32::from_be_bytes(b.get(1..5)?.try_into().ok()?) as usize;
+                let (mut items, mut i) = (vec![], 5);
+                for _ in 0..n {
+                    let (v, used) = Amf::decode(b.get(i..)?)?;
+                    items.push(v);
+                    i += used;
+                }
+                Some((Amf::Array(items), i))
+            }
             _ => None,
         }
     }
@@ -290,16 +307,28 @@ impl ChunkReader {
 
 // ---------------------------------------------------------------- FLV
 
-pub fn flv_video_header(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut v = vec![0x17, 0, 0, 0, 0];
-    v.extend(avcc_record(sps, pps));
+/// FourCC of HEVC in enhanced RTMP (E-RTMP v1).
+const HVC1: &[u8; 4] = b"hvc1";
+
+/// Video sequence header: legacy AVC (codec id 7) with the `avcC` record,
+/// or an enhanced-RTMP `hvc1` SequenceStart with the `hvcC` record.
+pub fn flv_video_header(hevc: bool, record: &[u8]) -> Vec<u8> {
+    let mut v = if hevc { [&[0x80 | 0x10][..], HVC1].concat() } else { vec![0x17, 0, 0, 0, 0] };
+    v.extend_from_slice(record);
     v
 }
 
-pub fn flv_video(key: bool, avcc: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(avcc.len() + 5);
-    v.extend_from_slice(&[if key { 0x17 } else { 0x27 }, 1, 0, 0, 0]);
-    v.extend_from_slice(avcc);
+/// One access unit (4-byte length-prefixed NAL units). HEVC uses enhanced
+/// RTMP's CodedFramesX (no composition offset: no B-frames).
+pub fn flv_video(hevc: bool, key: bool, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(data.len() + 5);
+    if hevc {
+        v.push(0x80 | if key { 0x10 } else { 0x20 } | 3);
+        v.extend_from_slice(HVC1);
+    } else {
+        v.extend_from_slice(&[if key { 0x17 } else { 0x27 }, 1, 0, 0, 0]);
+    }
+    v.extend_from_slice(data);
     v
 }
 
@@ -339,6 +368,8 @@ struct Conn {
     reader: ChunkReader,
     stream_id: u32,
     sent: u64,
+    /// The server didn't rule out enhanced-RTMP HEVC.
+    hevc_ok: bool,
 }
 
 impl Conn {
@@ -360,7 +391,7 @@ impl Conn {
         } else {
             Box::new(tcp)
         };
-        let mut c = Conn { s, reader: ChunkReader::default(), stream_id: 0, sent: 0 };
+        let mut c = Conn { s, reader: ChunkReader::default(), stream_id: 0, sent: 0, hevc_ok: true };
         c.s.set_read_timeout(Some(Duration::from_secs(10)))?;
         c.handshake()?;
         c.publish(u, key)?;
@@ -442,10 +473,17 @@ impl Conn {
                     ("type", Amf::Str("nonprivate".into())),
                     ("flashVer", Amf::Str("FMLE/3.0 (compatible; rec-rs)".into())),
                     ("tcUrl", Amf::Str(u.tc_url.clone())),
+                    // Enhanced RTMP: codecs we can send.
+                    ("fourCcList", Amf::Array(vec![Amf::Str("hvc1".into()), Amf::Str("avc1".into())])),
                 ]),
             ],
         )?;
-        self.wait_command("connect", |v| v.first().and_then(Amf::str) == Some("_result") && v.get(1) == Some(&Amf::Number(1.0)))?;
+        let r = self.wait_command("connect", |v| v.first().and_then(Amf::str) == Some("_result") && v.get(1) == Some(&Amf::Number(1.0)))?;
+        // A server that lists its enhanced-RTMP codecs without HEVC can't
+        // take it; one that lists none may (YouTube does).
+        self.hevc_ok = !r.iter().any(|a| {
+            matches!(a.get("fourCcList"), Some(Amf::Array(l)) if !l.iter().any(|c| matches!(c.str(), Some("hvc1" | "*"))))
+        });
         self.cmd(0, &[Amf::Str("releaseStream".into()), Amf::Number(2.0), Amf::Null, Amf::Str(key.into())])?;
         self.cmd(0, &[Amf::Str("FCPublish".into()), Amf::Number(3.0), Amf::Null, Amf::Str(key.into())])?;
         self.cmd(0, &[Amf::Str("createStream".into()), Amf::Number(4.0), Amf::Null])?;
@@ -523,7 +561,13 @@ struct Tag {
 #[derive(Default)]
 struct Shared {
     queue: VecDeque<Tag>,
-    formats: Option<(Vec<u8>, Vec<u8>)>,
+    /// (HEVC, decoder configuration record) of the video being sent.
+    formats: Option<(bool, Vec<u8>)>,
+    /// HEVC doesn't work with this server: ask the encoder for H.264.
+    hevc_refused: bool,
+    /// HEVC sessions that failed early (a server without enhanced RTMP
+    /// drops the connection).
+    hevc_failures: u32,
     width_height: (usize, usize),
     state: String,
     error: Option<String>,
@@ -582,8 +626,13 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                 continue;
             }
         };
+        let opened = Instant::now();
         {
             let mut s = lock.lock().unwrap();
+            if !conn.hevc_ok && !s.hevc_refused {
+                eprintln!("rec: stream {}: the server doesn't take HEVC; switching to H.264", u.host);
+                s.hevc_refused = true;
+            }
             s.state = "live".into();
             s.error = None;
             s.live_since.get_or_insert_with(Instant::now);
@@ -605,7 +654,7 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                 (s.queue.drain(..).collect::<Vec<_>>(), s.formats.clone(), s.width_height)
             };
             if !headers_sent
-                && let Some((sps, pps)) = &formats
+                && let Some((hevc, record)) = &formats
             {
                 let meta = command(&[
                     Amf::Str("@setDataFrame".into()),
@@ -613,7 +662,7 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                     Amf::Ecma(vec![
                         ("width".into(), Amf::Number(wh.0 as f64)),
                         ("height".into(), Amf::Number(wh.1 as f64)),
-                        ("videocodecid".into(), Amf::Number(7.0)),
+                        ("videocodecid".into(), Amf::Number(if *hevc { u32::from_be_bytes(*HVC1) as f64 } else { 7.0 })),
                         ("audiocodecid".into(), Amf::Number(10.0)),
                         ("audiosamplerate".into(), Amf::Number(48000.0)),
                         ("stereo".into(), Amf::Bool(true)),
@@ -622,7 +671,7 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                 ]);
                 let sid = conn.stream_id;
                 conn.send(C_AUDIO, 18, sid, 0, &meta)?;
-                conn.send(C_VIDEO, 9, sid, 0, &flv_video_header(sps, pps))?;
+                conn.send(C_VIDEO, 9, sid, 0, &flv_video_header(*hevc, record))?;
                 conn.send(C_AUDIO, 8, sid, 0, &flv_audio_header())?;
                 headers_sent = true;
             }
@@ -647,6 +696,15 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
         }
         if let Err(e) = result {
             let mut s = lock.lock().unwrap();
+            // HEVC dropped within seconds, twice: assume the server can't
+            // take it.
+            if s.formats.as_ref().is_some_and(|f| f.0) && opened.elapsed() < Duration::from_secs(10) {
+                s.hevc_failures += 1;
+                if s.hevc_failures >= 2 && !s.hevc_refused {
+                    eprintln!("rec: stream {}: HEVC keeps failing; switching to H.264", u.host);
+                    s.hevc_refused = true;
+                }
+            }
             s.error = Some(redact(&e));
             s.state = "reconnecting".into();
             s.reconnects += 1;
@@ -671,11 +729,21 @@ impl Output for RtmpOutput {
     fn packet(&mut self, p: &Packet, f: &Formats) {
         let (lock, cv) = &*self.shared;
         let mut s = lock.lock().unwrap();
-        if s.formats.is_none() && !f.sps.is_empty() {
-            s.formats = Some((f.sps.clone(), f.pps.clone()));
-        }
         match p {
             Packet::Video(v) => {
+                // New codec configuration (first keyframe, or the encoder
+                // switched codec): a sequence header goes ahead of it.
+                if v.key && !f.record.is_empty() && f.hevc == v.hevc && s.formats.as_ref() != Some(&(f.hevc, f.record.clone())) {
+                    let had = s.formats.is_some();
+                    s.formats = Some((f.hevc, f.record.clone()));
+                    if had && let Some(t0) = self.t0 {
+                        let ts = ((v.pts - t0) * 1000.0).round().max(0.0) as u32;
+                        s.queue.push_back(Tag { typ: 9, ts, body: Arc::new(flv_video_header(f.hevc, &f.record)) });
+                    }
+                }
+                if s.formats.as_ref().is_none_or(|(h, _)| *h != v.hevc) {
+                    return;
+                }
                 if self.t0.is_none() {
                     if !v.key {
                         return;
@@ -703,7 +771,7 @@ impl Output for RtmpOutput {
                     s.dropped += 1;
                     return;
                 }
-                s.queue.push_back(Tag { typ: 9, ts, body: Arc::new(flv_video(v.key, &v.data)) });
+                s.queue.push_back(Tag { typ: 9, ts, body: Arc::new(flv_video(v.hevc, v.key, &v.data)) });
             }
             Packet::Audio(a) => {
                 let Some(t0) = self.t0 else { return };
@@ -722,6 +790,10 @@ impl Output for RtmpOutput {
 
     fn take_keyframe_request(&mut self) -> bool {
         std::mem::take(&mut self.shared.0.lock().unwrap().want_key)
+    }
+
+    fn accepts_hevc(&self) -> bool {
+        !self.shared.0.lock().unwrap().hevc_refused
     }
 
     fn status(&self) -> OutputStatus {
@@ -812,9 +884,16 @@ mod tests {
     #[test]
     fn flv_bodies() {
         assert_eq!(flv_audio_header(), vec![0xAF, 0, 0x11, 0x90]);
-        assert_eq!(&flv_video(true, &[1, 2])[..5], &[0x17, 1, 0, 0, 0]);
-        assert_eq!(flv_video(false, &[9])[0], 0x27);
-        let h = flv_video_header(&[0x67, 0x64, 0, 0x28], &[0x68]);
+        assert_eq!(&flv_video(false, true, &[1, 2])[..5], &[0x17, 1, 0, 0, 0]);
+        assert_eq!(flv_video(false, false, &[9])[0], 0x27);
+        let h = flv_video_header(false, &[1, 0x64, 0, 0x28]);
         assert_eq!(&h[..6], &[0x17, 0, 0, 0, 0, 1]);
+        // Enhanced RTMP: IsExHeader | frame type | packet type, then FourCC.
+        assert_eq!(&flv_video_header(true, &[1])[..5], b"\x90hvc1");
+        assert_eq!(&flv_video(true, true, &[7])[..6], b"\x93hvc1\x07");
+        assert_eq!(flv_video(true, false, &[7])[0], 0xA3);
+        let mut b = vec![];
+        Amf::Array(vec![Amf::Str("hvc1".into()), Amf::Number(1.0)]).encode(&mut b);
+        assert_eq!(Amf::decode(&b).unwrap().0, Amf::Array(vec![Amf::Str("hvc1".into()), Amf::Number(1.0)]));
     }
 }
