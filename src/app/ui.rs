@@ -174,21 +174,24 @@ fn preview(ui: &mut Ui, st: &mut State) {
                 (rect.height() * ppp).round()
             );
         }
-        let r = CornerRadius::same(10);
-        ui.painter().rect_filled(rect, r, Color32::BLACK);
+        // Square and edge to edge: rounded corners would show the backdrop
+        // (black corners), and the frame already has the source's shape.
+        let r = CornerRadius::ZERO;
         let live = st.recording.is_some() || st.preview.is_some();
         match &st.preview_tex {
             Some(id) if live => {
-                egui::Image::new((*id, size)).corner_radius(r).paint_at(ui, rect);
+                egui::Image::new((*id, size)).paint_at(ui, rect);
             }
             _ => {
+                ui.painter().rect_filled(rect, CornerRadius::same(10), theme::pal(ui).control);
                 let msg = if st.finishing { "Saving…" } else { "No preview" };
                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(BODY), Color32::GRAY);
             }
         }
         if st.recording.is_some() {
             let border = if st.is_paused() { Color32::from_rgb(0xff, 0x95, 0x00) } else { RED };
-            ui.painter().rect_stroke(rect, r, Stroke::new(2.0, border), egui::StrokeKind::Inside);
+            // Around the picture, not over its edges.
+            ui.painter().rect_stroke(rect, r, Stroke::new(2.0, border), egui::StrokeKind::Outside);
         }
         if live && st.settings.scene == Scene::ScreenCam {
             drag_overlay(ui, st, rect);
