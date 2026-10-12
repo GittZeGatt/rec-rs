@@ -229,8 +229,8 @@ pub struct RecordArgs {
     /// Variable bitrate for the live encode (default: constant).
     #[arg(long)]
     vbr: bool,
-    /// Live audio bitrate in kb/s.
-    #[arg(long, default_value_t = 160)]
+    /// Live audio bitrate in kb/s (AAC; Opus for WHIP).
+    #[arg(long, default_value_t = 192)]
     audio_bitrate: u32,
     /// System audio gain in the mix track (dB).
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]

@@ -199,7 +199,7 @@ impl Session {
         }
         sink.set_audio_offsets([sys_ms / 1000.0, o.mic_offset_ms / 1000.0]);
         if let Some(l) = &o.live {
-            l.begin_session(o.system_audio, o.mic.is_some());
+            l.begin_session(o.system_audio, o.mic.is_some(), o.gains_db);
             sink.set_live(l.clone());
         }
         let stop = Arc::new(AtomicBool::new(false));

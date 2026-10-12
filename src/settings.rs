@@ -113,7 +113,7 @@ impl Default for Settings {
             stream_codec: "auto".into(),
             keyframe_secs: 2.0,
             stream_cbr: true,
-            stream_audio_kbps: 160,
+            stream_audio_kbps: 192,
             window: None,
         }
     }
@@ -154,6 +154,10 @@ impl Settings {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        // 160 kb/s was the default live audio bitrate; 192 is now.
+        if s.stream_audio_kbps == 160 {
+            s.stream_audio_kbps = 192;
+        }
         // REC_OUTPUT_DIR overrides the folder (self-tests keep files out of ~/Movies).
         if let Some(d) = std::env::var_os("REC_OUTPUT_DIR") {
             s.output_dir = PathBuf::from(d);

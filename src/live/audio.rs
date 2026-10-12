@@ -62,6 +62,8 @@ const fn fourcc(s: &[u8; 4]) -> u32 {
     u32::from_be_bytes(*s)
 }
 const BIT_RATE: u32 = fourcc(b"brat");
+/// kAudioConverterCodecQuality: encoder effort (0x7F = max).
+const CODEC_QUALITY: u32 = fourcc(b"cdqu");
 const MAGIC_COOKIE: u32 = fourcc(b"cmgc"); // kAudioConverterCompressionMagicCookie
 const PRIME_INFO: u32 = fourcc(b"prim");
 const MAX_OUT_PACKET: u32 = fourcc(b"xops");
@@ -165,6 +167,8 @@ impl AudioEncoder {
             feed: vec![],
         };
         unsafe {
+            let quality: u32 = 0x7F;
+            AudioConverterSetProperty(conv, CODEC_QUALITY, 4, &quality as *const u32 as *const c_void);
             let st = AudioConverterSetProperty(conv, BIT_RATE, 4, &bitrate as *const u32 as *const c_void);
             if st != 0 {
                 eprintln!("rec: warning: {codec:?} bitrate {bitrate} not accepted ({st})");

@@ -235,7 +235,7 @@ frames, and pauses don't count.
 | `--stream-codec` | `auto` | `auto` (HEVC when every destination is YouTube), `h264` or `hevc` (HEVC Main10 over enhanced RTMP or WHIP H.265; a server that refuses it gets H.264). |
 | `--keyframe` | `2` | Live keyframe interval in seconds (0.5–4). |
 | `--vbr` | CBR | Average bitrate instead of constant. |
-| `--audio-bitrate` | `160` | Live AAC/Opus kb/s. |
+| `--audio-bitrate` | `192` | Live AAC/Opus kb/s. |
 
 Other commands:
 
@@ -288,8 +288,8 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 |---|---|
 | 1 video | H.264 High, HEVC Main (`hvc1`) or ProRes 422. Constant frame rate, BT.709 tagged, keyframe every 2 s. |
 | 2 audio | **Mix** of system and mic: AAC-LC 48 kHz stereo, 256 kb/s. The default track, so players and uploaders use it. |
-| 3 audio | System audio stem: AAC 48 kHz stereo. |
-| 4 audio | Mic stem: AAC 48 kHz mono. |
+| 3 audio | System audio stem: AAC 48 kHz stereo, 256 kb/s. |
+| 4 audio | Mic stem: AAC 48 kHz mono, 192 kb/s. |
 
 - **Track grouping.** With one audio source there is a single audio track. The audio tracks
   share an alternate group with the mix as default, so QuickTime plays the mix and editors see

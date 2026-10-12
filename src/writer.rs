@@ -948,7 +948,7 @@ fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout
         let want_stems = !both || layout != AudioLayout::Mix;
         let mix_input = if want_mix { Some(mk_audio(2, 256_000)?) } else { None };
         let sys = if system_audio && want_stems { Some(mk_audio(2, 256_000)?) } else { None };
-        let mic = if mic && want_stems { Some(mk_audio(1, 128_000)?) } else { None };
+        let mic = if mic && want_stems { Some(mk_audio(1, 192_000)?) } else { None };
         if let (Some(mixi), true) = (&mix_input, want_stems) {
             // One alternate group, mix as default: QuickTime/AVPlayer play
             // only the mix; editors still see every track.
