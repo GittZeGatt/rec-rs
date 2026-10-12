@@ -1,5 +1,59 @@
 # PROGRESS
 
+## 4K quality: sharp preview, native capture, high-quality streaming (your request, 2026-10-12): done
+
+All measured with SSIM-Y / PSNR-Y (dB) / VMAF against lossless references.
+Details are in [PERFORMANCE.md](PERFORMANCE.md#picture-quality-2026-10-12).
+
+- **Recording captures at native resolution.** A 5K display is captured at 5120x2880 and
+  scaled to 4K by a Metal Lanczos filter, per YCbCr plane, with no copies (ScreenCaptureKit's own
+  scaling was soft):
+
+  | Output | Before | After |
+  |---|---|---|
+  | 4K | 0.9948 / 35.0 / 90.2 | 0.9971 / 40.9 / 100 |
+  | 1080p | 0.9948 / 35.3 / 88.8 | 0.9934 / 39.6 / 98.5 |
+
+  That's on ProRes, so the scaler is measured. Default encodes: 4K HEVC 42.7 dB / VMAF 100. It
+  costs about 3% of a core.
+- **Preview is pixel-sharp.** It is scaled to the preview's exact pixel size (2x on Retina) and
+  drawn 1:1 from the frame's IOSurface, with no 960 px proxy and no CPU copies. Measured on its
+  pixels:
+
+  | Window | Before VMAF | After VMAF |
+  |---|---|---|
+  | Default | 45.9 | 94.0 |
+  | Large | 16.6 | 94.2 |
+
+  - CPU per frame dropped from 1.3–1.9 ms to 0.25–0.39 ms.
+  - The UI and preview are color-managed (sRGB, so they're no longer oversaturated on P3
+    displays).
+  - Settings has a low-power preview option.
+  - The app no longer burns a core while hidden or locked (100% → 2%).
+- **4K streaming.**
+  - **Codec:** HEVC Main10 via enhanced RTMP (YouTube) or WHIP H.265, falling back to H.264 per
+    server.
+  - **Bitrate presets:** YouTube 4K60 45 Mb/s H.264 or 35 HEVC; Twitch capped at 6 Mb/s and
+    1080p.
+  - **Encoding:** keyframes every 2 s, BT.709 limited-range tags. A smaller live size is scaled
+    with the Lanczos scaler.
+  - **Static-text 4K stream:** 0.9942 / 33.5 / 87.6 before, 0.9974 / 41.8 / 100 after
+    (H.264 45 Mb/s) and 0.9947 / 41.6 / 100 (HEVC).
+  - **4K60 motion:** VMAF 76 at the old 6 Mb/s, 94.4 at 45 Mb/s H.264, 95.3 at 35 Mb/s HEVC.
+- **New tools.**
+  - `scripts/testcard.swift` draws a static 5K text card.
+  - `scripts/quality.sh` scores recordings and streams.
+  - `scripts/encquality.sh` scores the encoder on motion.
+  - `preview_pixels` is an ignored test that measures the preview.
+- **Not verified.**
+  - **An on-screen screenshot of the new preview.** Your screen locked during the run and the 5K
+    displays were then disconnected, so the preview was measured on the exact pixels its texture
+    holds. The app self-test confirms it renders frames.
+  - **Streaming HEVC to YouTube itself.** It was tested against a local MediaMTX, which accepted
+    enhanced-RTMP HEVC and WHIP H.265.
+  - **4K streaming in the app needs the 4K output setting.** The live encode is never larger
+    than the recording size.
+
 ## Pause/resume check, replay buffer and streaming (your request, 2026-10-11 ~12:30): done
 
 - **Pause/resume in the app: verified.** In a scripted run with a 1.5 s pause, the file is
@@ -239,3 +293,6 @@ These are tracked in the README under "Known gaps".
 - **2026-10-11 12:30–14:00:** Pause/resume verified in the app; replay buffer; RTMP/RTMPS and
   WHIP streaming from one shared encode, with Keychain keys, reconnects and live status; app UI,
   ⇧⌘S and menu items; tested against a local MediaMTX.
+- **2026-10-12 08:30–11:00:** 4K quality: native capture with Metal Lanczos scaling; HEVC
+  (enhanced RTMP, WHIP) and platform presets for streams; pixel-sharp zero-copy preview; sRGB
+  color management; idle while hidden. Measured with SSIM/PSNR/VMAF.

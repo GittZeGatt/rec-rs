@@ -10,7 +10,10 @@ with or without recording.
 It uses only Apple frameworks:
 
 - **ScreenCaptureKit** for display and window capture, system audio and the microphone. Frames
-  are IOSurface-backed `CVPixelBuffer`s that are never copied.
+  are IOSurface-backed `CVPixelBuffer`s that are never copied. The screen is captured at its
+  native resolution (a 5K display at 5120x2880) and scaled to the output by a Lanczos filter in
+  Metal Performance Shaders, which is much sharper than ScreenCaptureKit's own scaling (see
+  [Picture quality](PERFORMANCE.md#picture-quality-2026-10-12)).
 - **AVCaptureSession** for the webcam, and optionally the microphone.
 - **CoreImage on Metal** for compositing: webcam picture-in-picture and scenes.
 - **VideoToolbox through AVAssetWriter** for hardware H.264, HEVC or ProRes 422, plus AAC
@@ -103,7 +106,10 @@ open dist/Rec.app          # or: dist/rec-rs   (or: dist/rec-rs gui [--settings]
 The **main window** contains:
 
 - **Live preview** of exactly what will be recorded, including the webcam overlay. Rec's own
-  windows are excluded from capture.
+  windows are excluded from capture. It is rendered at the preview's exact size in pixels
+  (2x on Retina) with the Lanczos scaler and drawn 1:1, color-managed for the display, without
+  copying frames through the CPU. Settings has a low-power option (half resolution, 15 fps),
+  and nothing is drawn while the window is hidden or the screen is locked.
 - **Scene**:
   - Screen.
   - Screen + Cam: the webcam as an overlay. **Drag it in the preview** to place it anywhere;
@@ -225,7 +231,8 @@ frames, and pauses don't count.
 | `--stream DEST` | | Stream to `youtube`, `twitch`, an `rtmp://`/`rtmps://` URL or a WHIP `http(s)://` URL. Repeatable: one encode feeds every destination. |
 | `--no-record` | | Write no file (replay buffer and/or streaming only). |
 | `--live-resolution` | `1080p` | Live encode size (never above the capture). |
-| `--stream-bitrate` | `6000` | Live video kb/s. |
+| `--stream-bitrate` | platform preset | Live video kb/s. By default the platform's recommendation for the size and frame rate: YouTube 2160p60 45 Mb/s H.264 or 35 HEVC (2160p30 35/25, 1440p 24/16, 1080p 12/10); Twitch at most 6 Mb/s and 1080p; others like YouTube. |
+| `--stream-codec` | `auto` | `auto` (HEVC when every destination is YouTube), `h264` or `hevc` (HEVC Main10 over enhanced RTMP or WHIP H.265; a server that refuses it gets H.264). |
 | `--keyframe` | `2` | Live keyframe interval in seconds (0.5–4). |
 | `--vbr` | CBR | Average bitrate instead of constant. |
 | `--audio-bitrate` | `160` | Live AAC/Opus kb/s. |
@@ -249,10 +256,15 @@ rec-rs record --stream youtube --replay 60        # record, stream and keep a re
 rec-rs record --no-record --stream rtmp://localhost/live --stream http://localhost:8889/live/whip
 ```
 
-- **One encode.** Every composited frame goes once through a real-time VideoToolbox H.264
-  session (High profile, no B-frames, keyframe interval, CBR or average bitrate) together
-  with its own audio mix (AAC; Opus for WHIP). The replay buffer and every stream share it. It
-  keeps running while a recording is paused.
+- **One encode.** Every composited frame goes once through a real-time VideoToolbox session,
+  together with its own audio mix (AAC; Opus for WHIP). The replay buffer and every stream share
+  it, and it keeps running while a recording is paused.
+  - Video is H.264 High or HEVC Main10, with no B-frames, a keyframe every 2 s, and CBR or
+    average bitrate. The bitstream carries BT.709 limited-range tags.
+  - A live size smaller than the capture (record 4K, stream 1080p) is scaled with the same
+    Lanczos scaler.
+  - HEVC goes out as enhanced RTMP (`hvc1`), as YouTube accepts, or as WHIP H.265. If any
+    destination can't take HEVC, the encode switches to H.264.
 - **Replay buffer.** Packets are kept from a keyframe, trimmed a GOP at a time. A saved clip
   passes the video through and re-encodes the audio from the decoded AAC, so QuickTime and
   ffmpeg agree on its sync. 60 s at 6 Mb/s uses about 45 MB.
@@ -324,7 +336,8 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | Crash-safe files | ✅ hybrid/fragmented MP4 | ✅ fragments every 2 s |
 | Pause / resume | ✅ | ✅ sample-accurate, app and CLI; the pause is cut from the file, audio stays in sync |
 | Replay buffer | ✅ | ✅ 15–300 s in memory, ⇧⌘S or `save-replay` writes an MP4 without stopping, memory use shown |
-| Streaming | ✅ RTMP, WHIP, SRT, multitrack | ✅ RTMP/RTMPS (YouTube, Twitch, custom) and WHIP, several at once from one encode, auto-reconnect, live status; key in the Keychain |
+| Streaming | ✅ RTMP, WHIP, SRT, multitrack | ✅ RTMP/RTMPS (YouTube, Twitch, custom) and WHIP, several at once from one encode, H.264 or HEVC Main10 (enhanced RTMP), platform bitrate presets up to 4K60, auto-reconnect, live status; key in the Keychain |
+| Screen scaling | GPU bilinear/bicubic/Lanczos | ✅ native capture, Metal Lanczos per plane (5K→4K VMAF 100 vs 90 for ScreenCaptureKit) |
 | Live preview | ✅ | ✅ |
 | Level meters | ✅ | ✅ peak with hold |
 | Global hotkey | ✅ configurable | ✅ ⇧⌘R record, ⇧⌘S save replay (fixed) |
@@ -340,9 +353,11 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 - **Capture sources.** There is no application capture or multi-display capture. Region capture
   is CLI-only.
 - **Missing features.** There are no audio filters, and the hotkeys aren't configurable.
-- **Streaming.** RTMP/RTMPS and WHIP only (no SRT, no multitrack/enhanced RTMP). The app
-  streams to one destination at a time; the CLI takes several. The live encode is H.264 8-bit
-  up to 4K. Changing the live encode settings needs the stream stopped.
+- **Streaming.** RTMP/RTMPS (with enhanced-RTMP HEVC) and WHIP only, with no SRT or
+  multitrack. The app streams to one destination at a time; the CLI takes several. The live
+  encode is never larger than the recording size, so a 4K stream needs the 4K output setting.
+  Changing the live encode settings needs the stream stopped. HEVC to YouTube was tested only
+  against a local server, not YouTube itself.
 - **8-bit SDR only.** HDR displays are tone-mapped by ScreenCaptureKit.
 - **Webcam overlay.** The overlay is burned into the video; there is no separate camera track.
 - **Output latency read once.** It is read when recording starts. Switching output devices
@@ -370,5 +385,6 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | `src/tcc.rs` | Permissions and responsibility disclaim |
 | `src/probe.rs` | AVFoundation verification |
 | `src/synth.rs` | Test pattern with flash + beep |
-| `scripts/` | Build, self-test, soak and sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation) |
+| `src/scale.rs` | Native-resolution screen scaling (Metal Performance Shaders Lanczos, VideoToolbox fallback) |
+| `scripts/` | Build, self-test, soak, sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation) and quality metrics (`quality.sh`, `encquality.sh`, `testcard.swift`) |
 | `analysis/OBS_ARCHITECTURE.md` | OBS study |

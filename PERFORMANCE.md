@@ -162,7 +162,105 @@ With a busy CBR stream, WHIP sends only the real picture data. str0m drops the H
 units VideoToolbox pads CBR with, so a static screen streams at about 0.5 Mb/s over WebRTC
 and at the full 6 Mb/s over RTMP.
 
+## Picture quality (2026-10-12)
+
+Measured with real metrics against lossless references (ffmpeg 8.1:
+`ssim`, `psnr`, `libvmaf` with the 4K model at 2160p), on an M4 Pro.
+Values are SSIM-Y / PSNR-Y (dB) / VMAF.
+
+**Reference.** `scripts/testcard.swift` draws a static 5120x2880 text card
+(UI text at 9-24 pt, code, colored text on colored backgrounds, 1 px lines,
+gradients) and shows it 1:1 on a 5K display. A lossless `screencapture` of
+it, converted to sRGB (64 dB from the drawn card, so the display path is
+exact), is the reference, scaled to each output size with Lanczos in RGB.
+`scripts/quality.sh` records or streams that window and scores the middle
+second.
+
+### Recording: capture and scaling (5K display to 4K, 1440p, 1080p)
+
+ProRes, so the scaler is measured rather than the encoder:
+
+| Scaler | 4K | 1440p | 1080p |
+|---|---|---|---|
+| Before: ScreenCaptureKit scales (`scalesToFit`) | 0.9948 / 35.0 / 90.2 | 0.9943 / 35.0 / 91.9 | 0.9948 / 35.3 / 88.8 |
+| VideoToolbox pixel transfer, area average (tried) | 0.9967 / 36.6 / 96.4 | 0.9869 / 30.0 / 95.2 | 0.9737 / 27.9 / 79.2 |
+| **After: native capture + Metal Lanczos per plane** | **0.9971 / 40.9 / 100** | **0.9955 / 40.7 / 100** | **0.9934 / 39.6 / 98.5** |
+| Native 5K, no scaling (capture path alone) | 0.9995 / 48.4 / 100 | | |
+
+Default settings, encoded: 4K HEVC 0.9973 / 42.7 / 100, 1080p H.264
+0.9935 / 40.7 / 97.3 (before: 0.9948 / 35.3 / 87.6). Capturing at native
+5K and scaling on the GPU costs about 3% of one core more (CPU time 0.96 s
+-> 1.57 s over 20 s of 4K recording) and 4 MB of memory.
+
+### Streaming: 4K into a local MediaMTX, scored on its own recording
+
+| Stream | Result |
+|---|---|
+| Before: SCK scaling, old encoder settings, 6 Mb/s H.264 (old default), 4K | 0.9942 / 33.5 / 87.6 |
+| Before: same at 1080p | 0.9931 / 33.5 / 86.3 |
+| After: RTMP H.264 High, 45 Mb/s (YouTube 4K60 preset) | 0.9974 / 41.8 / 100 |
+| After: enhanced RTMP HEVC Main10, 35 Mb/s (YouTube HEVC preset) | 0.9947 / 41.6 / 100 |
+| After: WHIP H.265 Main10 | 0.9947 / 41.6 / 100 |
+| After: 1080p stream from a 4K capture (Lanczos, 12 Mb/s preset) | 0.9938 / 40.1 / 96.6 |
+
+A static card hides encoder differences (it compresses to almost
+nothing), so the encoder itself was measured on motion with
+`scripts/encquality.sh`: 2 s lossless 4K60 clips (the card scrolling 6 px
+a frame, and ffmpeg's testsrc2), encoded by the live encoder in real time,
+PSNR-Y / VMAF:
+
+| Encode | Scrolling text | Motion graphics |
+|---|---|---|
+| H.264, 6 Mb/s (old default) | 43.9 / 99.5 | 33.9 / 76.1 |
+| H.264, 45 Mb/s (YouTube 4K60 preset) | 54.1 / 99.98 | 40.7 / 94.4 |
+| HEVC Main, 35 Mb/s | 49.5 / 99.95 | 39.7 / 93.9 |
+| **HEVC Main10, 35 Mb/s (YouTube HEVC preset)** | 47.6 / 99.98 | **41.1 / 95.3** |
+| HEVC Main10, 25 Mb/s (4K30 preset) | 46.9 / 99.94 | 39.2 / 93.0 |
+
+- **Bitrate is what matters at 4K.** 6 Mb/s gives VMAF 76 on motion, and
+  the platform presets give 94-95.
+- **HEVC at 35 Mb/s beats H.264 at 45.**
+- **Main10 is worth it.** It gains 1.4 dB / 1.4 VMAF on motion over Main.
+- **Some settings had no effect.** Quality-over-speed and power hints made
+  no measurable difference on this chip, since real-time mode already
+  favors quality.
+- **Look-ahead was dropped.** VideoToolbox's look-ahead overshot the
+  target bitrate (39 vs 34 Mb/s) without a clear gain.
+- **Color tags.** Streams carry BT.709 limited-range tags. A gray ramp
+  encodes to Y 16-234, so there's no range error.
+
+### App preview
+
+The preview pixels, measured offline (`cargo test --release preview_pixels --
+--ignored`, from a real 4K frame of the card), against the card scaled
+ideally to the preview's size:
+
+| Preview size | Before: 960 px image stretched by egui | After: Lanczos to the exact pixel size, 1:1 |
+|---|---|---|
+| Default window (1436x808 px) | 0.952 / 27.0 / 45.9 | 0.991 / 36.5 / 94.0 |
+| Large window (2780x1564 px) | 0.927 / 24.0 / 16.6 | 0.994 / 36.7 / 94.2 |
+
+- **CPU per frame:** 1.3-1.9 ms before (CoreImage render, CPU readback and
+  swizzle), not counting the texture upload. After: 0.25-0.39 ms. The
+  scaled frame's IOSurface is the texture, with no copies.
+- **GPU wait:** the 2.6-6.5 ms wait for the GPU happens on a worker
+  thread, not the UI thread.
+- **Low-power mode** halves the resolution and the frame rate.
+- **Hidden windows:** while the window is covered, minimized or the screen
+  is locked, the app no longer draws. It went from about 100% of a core to
+  2% with the screen locked.
+- **Not measured on screen.** An on-screen screenshot of the running app
+  couldn't be taken during this work: the screen locked, then the 5K
+  displays were disconnected. The numbers above are the texture's pixels,
+  which the UI draws 1:1.
+
 ## Reproduce
+
+Quality: `scripts/quality.sh` (needs a 5K 2x display and `mediamtx` for
+the stream cases), `scripts/encquality.sh`, and `cargo test --release
+preview_pixels -- --ignored --nocapture` with `REC_PV_SRC`, `REC_PV_OUT`,
+`REC_PV_AREA`.
+
 
 ```sh
 scripts/soak.sh 1800                    # 4K60 + webcam + mic + system audio, 30 min
