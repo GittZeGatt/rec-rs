@@ -232,6 +232,8 @@ pub struct Sink {
     compositor: Option<Compositor>,
     /// Scales native-size screen frames to the output size.
     scaler: Option<crate::scale::FrameScaler>,
+    /// Fills a window capture's transparent corners (see `CornerFill`).
+    corner_fill: Option<crate::compose::CornerFill>,
     /// Output-size buffers for scaled screen frames fed to the compositor.
     scaled_pool: Option<CFRetained<CVPixelBufferPool>>,
     /// Output size and pixel format (for a pool created later).
@@ -357,6 +359,7 @@ impl Sink {
             cam_last: None,
             compositor,
             scaler: None,
+            corner_fill: None,
             scaled_pool: None,
             out_spec: (v.width, v.height, v.pixel_format),
             stats: Stats::default(),
@@ -455,6 +458,11 @@ impl Sink {
         self.scaler = Some(scaler);
     }
 
+    /// Screen frames are a single window's: fill its transparent corners.
+    pub fn fill_window_corners(&mut self) {
+        self.corner_fill = Some(crate::compose::CornerFill::new());
+    }
+
     pub fn set_live(&mut self, live: std::sync::Arc<crate::live::Live>) {
         self.live = Some(live);
     }
@@ -509,6 +517,10 @@ impl Sink {
         for (kind, sb) in std::mem::take(&mut self.preroll) {
             self.push_audio(kind, &sb.0);
         }
+        let pb = match self.corner_fill.as_mut() {
+            Some(f) => f.fill(&pb).unwrap_or(pb),
+            None => pb,
+        };
         self.screen_q.push_back((pts_s, SendBox(pb)));
         // Never hold more than a few ScreenCaptureKit surfaces (its queue
         // depth is 8).

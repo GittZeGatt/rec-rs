@@ -209,7 +209,7 @@ frames, and pauses don't count.
 | `-d, --display N` | `1` | Display number from `rec-rs devices` (1 = main). |
 | `--window W` | | Window ID or app/title substring. |
 | `--region X,Y,W,H` | | Crop a display region (points from top-left). |
-| `-r, --resolution` | `1080p` | `720p`, `1080p`, `1440p`, `4k`, `native`, `WxH`. Exact 16:9 frames, pillar-boxed when the display isn't 16:9 (or `--keep-aspect`). |
+| `-r, --resolution` | `1080p` | `720p`, `1080p`, `1440p`, `4k`, `native`, `WxH`: the largest frame with the display's (or window's) shape that fits that size, e.g. 1670x1080 for a 4112x2658 display. Never black bars, never cropped, never upscaled. |
 | `-f, --fps` | `60` | 24, 25, 30, 50, 60, 120. |
 | `--codec` | auto | `h264` up to 1080p, `hevc` above, `prores` (422, `.mov`). |
 | `--bitrate` | auto | Mb/s. About 20 for 1080p60 H.264, about 50 for 4K60 HEVC. |

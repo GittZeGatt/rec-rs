@@ -109,12 +109,15 @@ pub struct RecordArgs {
     /// Record a single window: window ID or app/title substring (`rec devices`).
     #[arg(long, value_name = "WINDOW")]
     window: Option<String>,
-    /// Output size: 720p, 1080p, 1440p, 4k, native, or WIDTHxHEIGHT.
+    /// Output size: 720p, 1080p, 1440p, 4k, native, or WIDTHxHEIGHT. The
+    /// frame keeps the display's (or window's) aspect ratio and fits inside
+    /// this size (1080p of a 16:10 display is 1728x1080), so there are never
+    /// black bars; it is never larger than the source.
     #[arg(short, long, default_value = "1080p")]
     resolution: String,
-    /// Shrink the frame to the display's aspect ratio instead of letterboxing
-    /// into an exact 16:9 frame.
-    #[arg(long)]
+    /// Accepted for compatibility: the frame always keeps the source's
+    /// aspect ratio now.
+    #[arg(long, hide = true)]
     keep_aspect: bool,
     /// Frames per second.
     #[arg(short, long, default_value_t = 60)]
@@ -253,26 +256,49 @@ fn even(x: f64) -> usize {
     ((x / 2.0).round() as usize * 2).max(2)
 }
 
-fn parse_size(s: &str, native: (usize, usize), keep_aspect: bool) -> Result<(usize, usize)> {
+/// Output size for `s` (a preset or WxH, the bounding box) and a source of
+/// `native` pixels: the source's aspect ratio fitted inside the box, never
+/// larger than the source, even dimensions. A frame with the source's shape
+/// fills edge to edge: no letterbox or pillarbox bars, nothing cropped.
+fn parse_size(s: &str, native: (usize, usize)) -> Result<(usize, usize)> {
     let lower = s.to_lowercase();
-    let boxed = match lower.as_str() {
-        "720p" => (1280, 720),
-        "1080p" => (1920, 1080),
-        "1440p" => (2560, 1440),
-        "4k" | "2160p" | "uhd" => (3840, 2160),
-        "native" => return Ok((even(native.0 as f64), even(native.1 as f64))),
+    // The capture's own size is the native size rounded down to even.
+    let (nw, nh) = ((native.0 & !1).max(2) as f64, (native.1 & !1).max(2) as f64);
+    let (bw, bh) = match lower.as_str() {
+        "720p" => (1280.0, 720.0),
+        "1080p" => (1920.0, 1080.0),
+        "1440p" => (2560.0, 1440.0),
+        "4k" | "2160p" | "uhd" => (3840.0, 2160.0),
+        "native" => (nw, nh),
         _ => {
             let Some((w, h)) = lower.split_once('x') else {
                 bail!("bad --resolution {s:?}: use 720p/1080p/1440p/4k/native/WxH")
             };
-            (w.trim().parse()?, h.trim().parse()?)
+            (w.trim().parse::<usize>()? as f64, h.trim().parse::<usize>()? as f64)
         }
     };
-    if !keep_aspect {
-        return Ok((even(boxed.0 as f64), even(boxed.1 as f64)));
-    }
-    let s = (boxed.0 as f64 / native.0 as f64).min(boxed.1 as f64 / native.1 as f64);
-    Ok((even(native.0 as f64 * s), even(native.1 as f64 * s)))
+    // Presets name the frame's height for landscape sources and its width
+    // for portrait ones (a 1080p portrait window is 1080 wide).
+    let (bw, bh) = if nh > nw && matches!(lower.as_str(), "720p" | "1080p" | "1440p" | "4k" | "2160p" | "uhd") { (bh, bw) } else { (bw, bh) };
+    let k = (bw / nw).min(bh / nh).min(1.0);
+    Ok((even(nw * k), even(nh * k)))
+}
+
+/// The live encode's bounding box for a preset or WxH (the encoder fits the
+/// frame inside it, keeping its aspect ratio).
+fn live_box(s: &str) -> Result<(usize, usize)> {
+    Ok(match s.to_lowercase().as_str() {
+        "720p" => (1280, 720),
+        "1080p" => (1920, 1080),
+        "1440p" => (2560, 1440),
+        "4k" | "2160p" | "uhd" => (3840, 2160),
+        other => {
+            let Some((w, h)) = other.split_once('x') else {
+                bail!("bad --live-resolution {s:?}: use 720p/1080p/1440p/4k/WxH")
+            };
+            (even(w.trim().parse::<f64>()?), even(h.trim().parse::<f64>()?))
+        }
+    })
 }
 
 /// `rec-rs stream-key DEST`: store (or delete) a stream key in the Keychain.
@@ -424,7 +450,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
             (Some(screen::Target::Display(d, None)), native)
         }
     };
-    let (w, h) = parse_size(&a.resolution, native, a.keep_aspect)?;
+    let (w, h) = parse_size(&a.resolution, native)?;
     let codec = a.codec.unwrap_or(if w * h > 1920 * 1080 { Codec::Hevc } else { Codec::H264 });
     // Bits per pixel per frame tuned for screen content (sharp text).
     let bpp = match codec {
@@ -447,7 +473,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
     }
     if a.replay.is_some() || !a.stream.is_empty() {
         let live = live::Live::new();
-        let (lw, lh) = parse_size(&a.live_resolution, (w, h), false)?;
+        let (lw, lh) = live_box(&a.live_resolution)?;
         let urls: Vec<String> = a.stream.iter().map(|d| live::destination_url(d)).collect();
         let platforms: Vec<live::Platform> = urls.iter().map(|u| live::platform(u)).collect();
         let want_hevc = match a.stream_codec.as_str() {
@@ -660,14 +686,24 @@ mod tests {
 
     #[test]
     fn sizes() {
+        // Every size keeps the source's aspect ratio (no bars), even sizes.
         let native = (3456, 2234);
-        assert_eq!(parse_size("1080p", native, false).unwrap(), (1920, 1080));
-        assert_eq!(parse_size("4K", native, false).unwrap(), (3840, 2160));
-        assert_eq!(parse_size("native", native, false).unwrap(), native);
-        assert_eq!(parse_size("1280x720", native, false).unwrap(), (1280, 720));
-        // keep-aspect shrinks to the display's 1.547 aspect, even sizes.
-        assert_eq!(parse_size("1080p", native, true).unwrap(), (1670, 1080));
-        assert!(parse_size("huge", native, false).is_err());
+        assert_eq!(parse_size("1080p", native).unwrap(), (1670, 1080));
+        assert_eq!(parse_size("4K", native).unwrap(), (3342, 2160));
+        assert_eq!(parse_size("native", native).unwrap(), native);
+        assert_eq!(parse_size("1280x720", native).unwrap(), (1114, 720));
+        assert_eq!(parse_size("1080p", (2880, 1800)).unwrap(), (1728, 1080));
+        assert_eq!(parse_size("1080p", (3840, 2160)).unwrap(), (1920, 1080));
+        // Never upscaled; odd sources round down to even, like the capture.
+        assert_eq!(parse_size("4k", (1201, 801)).unwrap(), (1200, 800));
+        // Portrait: the preset names the width.
+        assert_eq!(parse_size("1080p", (2160, 3840)).unwrap(), (1080, 1920));
+        for (sz, n) in [("1080p", (3456, 2234)), ("720p", (4112, 2658)), ("4k", (5120, 2880)), ("1440p", (3144, 1588))] {
+            let (w, h) = parse_size(sz, n).unwrap();
+            assert!(w % 2 == 0 && h % 2 == 0);
+            assert!(compose::same_aspect(n.0 as f64, n.1 as f64, w as f64, h as f64), "{sz} {n:?} -> {w}x{h}");
+        }
+        assert!(parse_size("huge", native).is_err());
     }
 
     #[test]

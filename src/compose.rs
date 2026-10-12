@@ -97,6 +97,27 @@ pub fn fit(sw: f64, sh: f64, dw: f64, dh: f64, cover: bool) -> (f64, f64, f64) {
     (s, (dw - sw * s) / 2.0, (dh - sh * s) / 2.0)
 }
 
+/// Aspect ratios this close (relative) count as the same: output sizes are
+/// rounded to even pixels, so a frame sized from its source differs from it
+/// by a fraction of a pixel.
+const SAME_ASPECT: f64 = 0.01;
+
+pub fn same_aspect(sw: f64, sh: f64, dw: f64, dh: f64) -> bool {
+    let (a, b) = (sw / sh, dw / dh);
+    ((a - b) / b).abs() <= SAME_ASPECT
+}
+
+/// Scale (x, y) and offset that put a `sw`x`sh` source into a `dw`x`dh`
+/// canvas edge to edge when their aspect ratios match up to rounding (a
+/// sub-pixel stretch instead of a hairline bar), else fitted and centred.
+pub fn fill(sw: f64, sh: f64, dw: f64, dh: f64) -> (f64, f64, f64, f64) {
+    if same_aspect(sw, sh, dw, dh) {
+        return (dw / sw, dh / sh, 0.0, 0.0);
+    }
+    let (s, tx, ty) = fit(sw, sh, dw, dh, false);
+    (s, s, tx, ty)
+}
+
 /// Where the overlay sits: snapped to a corner (stays there when the size
 /// changes) or centered at a point given as fractions of the frame from its
 /// top-left corner.
@@ -332,6 +353,68 @@ fn border_px(pip: &PipSpec, out_h: f64) -> f64 {
     (pip.border.max(0.0) * out_h / 1080.0).round()
 }
 
+/// Fills a window capture's transparent rounded corners. ScreenCaptureKit
+/// delivers a single window with its corners (and any other uncovered
+/// pixels) transparent, which a video frame shows as black. Behind the
+/// window this draws its own edge pixels stretched outward (a clamped inset
+/// of the frame), so each corner takes the color of the window chrome next
+/// to it: the frame stays edge to edge with no black and nothing cropped.
+pub struct CornerFill {
+    ctx: Retained<CIContext>,
+    cs: CFRetained<CGColorSpace>,
+    pool: Option<((usize, usize), CFRetained<objc2_core_video::CVPixelBufferPool>)>,
+}
+
+/// How far in from each edge the fill samples: past the largest window
+/// corner radius (about 26 points at 2x).
+pub fn corner_inset(w: f64, h: f64) -> f64 {
+    80.0f64.min(w / 4.0).min(h / 4.0).floor()
+}
+
+impl CornerFill {
+    pub fn new() -> Self {
+        unsafe {
+            let opts = dict(vec![(&*ns("kCIContextCacheIntermediates"), num_b(false))]);
+            let ctx = CIContext::contextWithOptions(Some(&opts));
+            let cs = CGColorSpace::with_name(Some(kCGColorSpaceSRGB)).expect("sRGB colorspace");
+            CornerFill { ctx, cs, pool: None }
+        }
+    }
+
+    /// `pb` (BGRA) with its transparent pixels filled; None if it has no
+    /// alpha to fill or a buffer could not be made.
+    pub fn fill(&mut self, pb: &CVPixelBuffer) -> Option<CFRetained<CVPixelBuffer>> {
+        use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferPool};
+        if CVPixelBufferGetPixelFormatType(pb) != PIX_BGRA {
+            return None;
+        }
+        let (w, h) = (CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb));
+        if self.pool.as_ref().is_none_or(|(sz, _)| *sz != (w, h)) {
+            self.pool = Some(((w, h), make_pool(w, h, PIX_BGRA)));
+        }
+        let pool = &self.pool.as_ref()?.1;
+        let mut out = std::ptr::null_mut();
+        unsafe { CVPixelBufferPool::create_pixel_buffer(None, pool, std::ptr::NonNull::from(&mut out)) };
+        let out: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(std::ptr::NonNull::new(out)?) };
+        unsafe {
+            let img = CIImage::imageWithCVPixelBuffer(pb);
+            let (fw, fh) = (w as f64, h as f64);
+            let i = corner_inset(fw, fh);
+            let canvas = rect(0.0, 0.0, fw, fh);
+            let back = img.imageByCroppingToRect(rect(i, i, fw - 2.0 * i, fh - 2.0 * i)).imageByClampingToExtent().imageByCroppingToRect(canvas);
+            let filled = img.imageByCompositingOverImage(&back);
+            self.ctx.render_toCVPixelBuffer_bounds_colorSpace(&filled, &out, canvas, Some(&self.cs));
+        }
+        Some(out)
+    }
+}
+
+impl Default for CornerFill {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Compositor {
     ctx: Retained<CIContext>,
     cs: CFRetained<CGColorSpace>,
@@ -407,8 +490,8 @@ impl Compositor {
                 let se = sc.extent();
                 // Fit the screen into the canvas (a no-op normally: the
                 // sink scales native-size captures to the output size).
-                let (s, tx, ty) = fit(se.size.width, se.size.height, self.w, self.h, false);
-                img = sc.imageByApplyingTransform(CGAffineTransform { a: s, b: 0.0, c: 0.0, d: s, tx, ty }).imageByCompositingOverImage(&img);
+                let (sx, sy, tx, ty) = fill(se.size.width, se.size.height, self.w, self.h);
+                img = sc.imageByApplyingTransform(CGAffineTransform { a: sx, b: 0.0, c: 0.0, d: sy, tx, ty }).imageByCompositingOverImage(&img);
             }
             if scene == Scene::ScreenCam && let Some(c) = cam {
                 let [x, top, tw, th] = overlay_rect(&self.pip, self.w, self.h, self.cam_aspect);
@@ -450,6 +533,20 @@ mod tests {
         assert_eq!((s, tx, ty), (1.125, 240.0, 0.0));
         let (s, tx, ty) = fit(1280.0, 960.0, 1920.0, 1080.0, true);
         assert_eq!((s, tx, ty), (1.5, 0.0, -180.0));
+    }
+
+    #[test]
+    fn fill_is_edge_to_edge_for_the_same_aspect() {
+        // A 4112x2658 display into its 1670x1080 output: a sub-pixel stretch,
+        // no offset, so no hairline bar on any edge.
+        let (sx, sy, tx, ty) = fill(4112.0, 2658.0, 1670.0, 1080.0);
+        assert_eq!((tx, ty), (0.0, 0.0));
+        assert!((4112.0 * sx - 1670.0).abs() < 1e-9 && (2658.0 * sy - 1080.0).abs() < 1e-9);
+        // A different shape (a window resized mid-recording) is fitted.
+        let (sx, sy, tx, ty) = fill(1280.0, 960.0, 1920.0, 1080.0);
+        assert_eq!((sx, sy, tx, ty), (1.125, 1.125, 240.0, 0.0));
+        assert_eq!(corner_inset(4086.0, 2464.0), 80.0);
+        assert_eq!(corner_inset(200.0, 100.0), 25.0);
     }
 
     fn spec(shape: Shape, place: Place) -> PipSpec {

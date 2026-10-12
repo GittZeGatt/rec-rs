@@ -170,7 +170,10 @@ impl Session {
     /// Start capturing. `write` false = preview-only (nothing written).
     pub fn start(o: &Options, target: Option<screen::Target>, write: bool, preview: Option<PreviewFn>) -> Result<Session> {
         let (w, h) = o.size;
-        let pixel_format = if o.webcam.is_some() { PIX_BGRA } else { PIX_420V };
+        // BGRA for the compositor, and for a window, whose transparent
+        // rounded corners are filled before encoding (420v has no alpha).
+        let window = matches!(target, Some(screen::Target::Window(_)));
+        let pixel_format = if o.webcam.is_some() || window { PIX_BGRA } else { PIX_420V };
         let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
@@ -179,6 +182,9 @@ impl Session {
             && let Some(sc) = crate::scale::FrameScaler::new(w, h)
         {
             sink.set_scaler(sc);
+        }
+        if window && o.test_pattern.is_none() {
+            sink.fill_window_corners();
         }
         sink.limit_secs(o.duration);
         // System audio from ScreenCaptureKit is captured when mixed and heard

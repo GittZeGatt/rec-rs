@@ -140,7 +140,8 @@ impl FrameScaler {
         (CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src)) != self.size
     }
 
-    /// Scale `src` into `out` (output size, same pixel format), letterboxed.
+    /// Scale `src` into `out` (output size, same pixel format), edge to edge
+    /// when the aspect ratios match (see `compose::fill`).
     pub fn scale(&mut self, src: &CVPixelBuffer, out: &CVPixelBuffer) -> bool {
         if self.metal.is_some() && self.scale_metal(src, out) {
             return true;
@@ -152,6 +153,10 @@ impl FrameScaler {
                 None => return false,
             },
         };
+        let (sw, sh) = (CVPixelBufferGetWidth(src) as f64, CVPixelBufferGetHeight(src) as f64);
+        let (w, h) = (self.size.0 as f64, self.size.1 as f64);
+        let mode = if crate::compose::same_aspect(sw, sh, w, h) { unsafe { kVTScalingMode_Normal } } else { unsafe { kVTScalingMode_Letterbox } };
+        set(vt, unsafe { kVTPixelTransferPropertyKey_ScalingMode }, mode);
         unsafe { vt.transfer_image(src, out) == 0 }
     }
 
@@ -163,9 +168,9 @@ impl FrameScaler {
         }
         let (sw, sh) = (CVPixelBufferGetWidth(src) as f64, CVPixelBufferGetHeight(src) as f64);
         let (w, h) = (self.size.0 as f64, self.size.1 as f64);
-        // Fit (letterbox) in output pixels, on even coordinates so the
-        // chroma planes line up.
-        let (s, tx, ty) = crate::compose::fit(sw, sh, w, h, false);
+        // Fill the frame (its size follows the source's aspect), else fit
+        // in output pixels, on even coordinates so the chroma planes line up.
+        let (sx, sy, tx, ty) = crate::compose::fill(sw, sh, w, h);
         let (tx, ty) = ((tx / 2.0).round() * 2.0, (ty / 2.0).round() * 2.0);
         let bars = tx > 0.0 || ty > 0.0;
         unsafe {
@@ -187,10 +192,10 @@ impl FrameScaler {
                     let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&pass) else { return false };
                     enc.endEncoding();
                 }
-                let t = MPSScaleTransform { scaleX: s, scaleY: s, translateX: tx * k, translateY: ty * k };
+                let t = MPSScaleTransform { scaleX: sx, scaleY: sy, translateX: tx * k, translateY: ty * k };
                 m.lanczos.setScaleTransform(&t);
                 let kernel: &MPSUnaryImageKernel = &m.lanczos;
-                let (cw, ch) = ((sw * s * k).round() as usize, (sh * s * k).round() as usize);
+                let (cw, ch) = ((sw * sx * k).round() as usize, (sh * sy * k).round() as usize);
                 kernel.setClipRect(MTLRegion {
                     origin: MTLOrigin { x: (tx * k) as usize, y: (ty * k) as usize, z: 0 },
                     size: MTLSize { width: cw.min(dt.tex.width()), height: ch.min(dt.tex.height()), depth: 1 },
