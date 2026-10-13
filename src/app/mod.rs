@@ -115,9 +115,17 @@ pub struct Meter {
 
 impl Meter {
     fn feed(&mut self, linear: f32, dt: f32) {
-        let db = if linear <= 1e-5 { -90.0 } else { 20.0 * linear.log10() };
+        let db = if linear <= 1e-5 {
+            -90.0
+        } else {
+            20.0 * linear.log10()
+        };
         self.db = db.max(self.db - 24.0 * dt).max(-90.0);
-        if db >= self.peak_db || self.peak_at.is_none_or(|t| t.elapsed() > Duration::from_millis(1500)) {
+        if db >= self.peak_db
+            || self
+                .peak_at
+                .is_none_or(|t| t.elapsed() > Duration::from_millis(1500))
+        {
             self.peak_db = db;
             self.peak_at = Some(Instant::now());
         }
@@ -226,7 +234,10 @@ impl State {
 
     /// Recorded time (excluding pauses) of the running recording.
     pub fn clock(&self) -> String {
-        self.recording.as_ref().map(|s| record::clock(s.recorded_secs())).unwrap_or_default()
+        self.recording
+            .as_ref()
+            .map(|s| record::clock(s.recorded_secs()))
+            .unwrap_or_default()
     }
 
     /// Send the overlay settings to the running session if they changed:
@@ -248,7 +259,10 @@ impl State {
 
     /// Whether the running session can switch to `scene` live.
     pub fn can_switch_live(&self, scene: Scene) -> bool {
-        let cam_running = self.recording.as_ref().is_some_and(|s| s.camera_name().is_some());
+        let cam_running = self
+            .recording
+            .as_ref()
+            .is_some_and(|s| s.camera_name().is_some());
         !scene.uses_cam() || cam_running
     }
 }
@@ -293,8 +307,20 @@ fn load_devices(st: &mut State) {
                 .collect()
         })
         .unwrap_or_default();
-    st.cameras = crate::camera::cameras().into_iter().map(|d| Device { id: d.id, name: d.name }).collect();
-    st.mics = crate::camera::microphones().into_iter().map(|d| Device { id: d.id, name: d.name }).collect();
+    st.cameras = crate::camera::cameras()
+        .into_iter()
+        .map(|d| Device {
+            id: d.id,
+            name: d.name,
+        })
+        .collect();
+    st.mics = crate::camera::microphones()
+        .into_iter()
+        .map(|d| Device {
+            id: d.id,
+            name: d.name,
+        })
+        .collect();
 }
 
 impl App {
@@ -363,24 +389,40 @@ impl App {
 
     fn gpu(&mut self, surface: &wgpu::Surface<'static>) -> &Gpu {
         if self.gpu.is_none() {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(surface),
-                ..Default::default()
-            }))
-            .expect("no compatible GPU adapter");
-            let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("rec-rs"),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
-                ..Default::default()
-            }))
-            .expect("create device");
-            self.gpu = Some(Gpu { instance, adapter, device, queue });
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+            );
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: Some(surface),
+                    ..Default::default()
+                }))
+                .expect("no compatible GPU adapter");
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("rec-rs"),
+                    required_limits:
+                        wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+                    ..Default::default()
+                }))
+                .expect("create device");
+            self.gpu = Some(Gpu {
+                instance,
+                adapter,
+                device,
+                queue,
+            });
         }
         self.gpu.as_ref().unwrap()
     }
 
-    fn open_window(&mut self, el: &ActiveEventLoop, title: &str, size: (f64, f64), min: (f64, f64)) -> Win {
+    fn open_window(
+        &mut self,
+        el: &ActiveEventLoop,
+        title: &str,
+        size: (f64, f64),
+        min: (f64, f64),
+    ) -> Win {
         use winit::platform::macos::WindowAttributesExtMacOS;
         let attrs = Window::default_attributes()
             .with_title(title)
@@ -395,26 +437,41 @@ impl App {
         let surface = match &self.gpu {
             Some(g) => g.instance.create_surface(window.clone()).expect("surface"),
             None => {
-                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+                let instance = wgpu::Instance::new(
+                    wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+                );
                 let s = instance.create_surface(window.clone()).expect("surface");
-                let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    compatible_surface: Some(&s),
-                    ..Default::default()
-                }))
-                .expect("no compatible GPU adapter");
-                let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                    label: Some("rec-rs"),
-                    required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
-                    ..Default::default()
-                }))
-                .expect("create device");
-                self.gpu = Some(Gpu { instance, adapter, device, queue });
+                let adapter =
+                    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                        compatible_surface: Some(&s),
+                        ..Default::default()
+                    }))
+                    .expect("no compatible GPU adapter");
+                let (device, queue) =
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                        label: Some("rec-rs"),
+                        required_limits:
+                            wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+                        ..Default::default()
+                    }))
+                    .expect("create device");
+                self.gpu = Some(Gpu {
+                    instance,
+                    adapter,
+                    device,
+                    queue,
+                });
                 s
             }
         };
         let g = self.gpu(&surface);
         let caps = surface.get_capabilities(&g.adapter);
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let px = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -428,7 +485,8 @@ impl App {
             color_space: Default::default(),
         };
         surface.configure(&g.device, &config);
-        let renderer = egui_wgpu::Renderer::new(&g.device, format, egui_wgpu::RendererOptions::default());
+        let renderer =
+            egui_wgpu::Renderer::new(&g.device, format, egui_wgpu::RendererOptions::default());
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let egui = egui_winit::State::new(
@@ -445,12 +503,33 @@ impl App {
         // display (wide-gamut panels otherwise show them oversaturated).
         macos::tag_layers_srgb(&window);
         window.request_redraw();
-        Win { window, surface, config, egui, ctx, renderer, repaint_at: None, occluded: false }
+        Win {
+            window,
+            surface,
+            config,
+            egui,
+            ctx,
+            renderer,
+            repaint_at: None,
+            occluded: false,
+        }
     }
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
         if self.main.is_none() {
-            let w = self.open_window(el, "Rec", (1040.0, 660.0), (860.0, 560.0));
+            // REC_MAIN_SIZE=WxH or full: open at this size or fullscreen (layout checks).
+            let size = std::env::var("REC_MAIN_SIZE")
+                .ok()
+                .and_then(|v| {
+                    v.split_once('x')
+                        .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                })
+                .unwrap_or((1040.0, 660.0));
+            let w = self.open_window(el, "Rec", size, (860.0, 560.0));
+            if std::env::var("REC_MAIN_SIZE").as_deref() == Ok("full") {
+                w.window
+                    .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
             self.main = Some(w);
         }
         if let Some(w) = &self.main {
@@ -493,13 +572,19 @@ impl App {
         }
     }
 
-    fn options(&mut self, output: Option<&std::path::Path>) -> Result<(record::Options, Option<crate::screen::Target>)> {
+    fn options(
+        &mut self,
+        output: Option<&std::path::Path>,
+    ) -> Result<(record::Options, Option<crate::screen::Target>)> {
         // A display that was unplugged falls back to the main one.
         let mut settings = self.st.settings.clone();
         let mut warning = None;
         let count = crate::screen::displays().map(|d| d.len()).unwrap_or(0);
         if count > 0 && settings.window.is_none() && settings.display > count {
-            warning = Some(format!("Display {} not connected; using display 1", settings.display));
+            warning = Some(format!(
+                "Display {} not connected; using display 1",
+                settings.display
+            ));
             settings.display = 1;
             eprintln!("rec: warning: {}", warning.as_deref().unwrap_or_default());
         }
@@ -508,7 +593,11 @@ impl App {
         let (mut o, t) = crate::prepare(crate::parse_record_args(&refs)?)?;
         o.live = Some(self.st.live.clone());
         // Fallbacks never block: say so once.
-        let warning = [warning, o.mic_warning.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        let warning = [warning, o.mic_warning.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
         let warning = Some(warning).filter(|w| !w.is_empty());
         if warning != self.st.mic_warned {
             if let Some(w) = &warning {
@@ -525,7 +614,9 @@ impl App {
     fn devices_changed(&mut self) {
         load_devices(&mut self.st);
         let s = &self.st.settings;
-        let Some(sel) = s.mic.as_deref().filter(|_| s.mic_enabled) else { return };
+        let Some(sel) = s.mic.as_deref().filter(|_| s.mic_enabled) else {
+            return;
+        };
         if self.st.recording.is_some() || self.st.preview.is_none() {
             return;
         }
@@ -547,7 +638,11 @@ impl App {
         if self.st.live.config() != cfg {
             self.st.live.set_config(cfg);
         }
-        let want = self.st.settings.replay_enabled.then(|| self.st.settings.replay_secs.clamp(15, 300) as f64);
+        let want = self
+            .st
+            .settings
+            .replay_enabled
+            .then(|| self.st.settings.replay_secs.clamp(15, 300) as f64);
         let have = self.st.live.replay_stats().is_some();
         if want.is_some() || have {
             self.st.live.set_replay(want);
@@ -555,11 +650,16 @@ impl App {
         self.st.replay_stats = self.st.live.replay_stats();
         match (want.is_some(), self.st.replay_hotkey.is_some()) {
             (true, false) => {
-                let ok = crate::hotkey::register(HOTKEY_REPLAY, crate::hotkey::KEY_S, crate::hotkey::CMD | crate::hotkey::SHIFT, || {
-                    push(Cmd::SaveReplay)
-                });
+                let ok = crate::hotkey::register(
+                    HOTKEY_REPLAY,
+                    crate::hotkey::KEY_S,
+                    crate::hotkey::CMD | crate::hotkey::SHIFT,
+                    || push(Cmd::SaveReplay),
+                );
                 if let Err(code) = ok {
-                    eprintln!("rec: could not register ⇧⌘S (error {code}); use the Save Replay button");
+                    eprintln!(
+                        "rec: could not register ⇧⌘S (error {code}); use the Save Replay button"
+                    );
                 }
                 self.st.replay_hotkey = Some(ok.is_ok());
             }
@@ -569,14 +669,25 @@ impl App {
             }
             _ => {}
         }
-        self.st.stream_status = self.st.stream_id.and_then(|id| self.st.live.statuses().into_iter().find(|(i, _)| *i == id).map(|(_, s)| s));
+        self.st.stream_status = self.st.stream_id.and_then(|id| {
+            self.st
+                .live
+                .statuses()
+                .into_iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| s)
+        });
     }
 
     fn save_replay(&mut self) {
         if self.st.replay_stats.is_none() {
             return;
         }
-        let path = self.st.settings.output_dir.join(crate::settings::timestamped("replay", "mp4"));
+        let path = self
+            .st
+            .settings
+            .output_dir
+            .join(crate::settings::timestamped("replay", "mp4"));
         let r = std::fs::create_dir_all(&self.st.settings.output_dir)
             .map_err(anyhow::Error::from)
             .and_then(|_| self.st.live.save_replay(path));
@@ -593,7 +704,8 @@ impl App {
             return;
         }
         let url = self.st.settings.stream_url();
-        let r = crate::live::resolve_destination(&url).and_then(|(url, key)| crate::live::start_output(&url, &key));
+        let r = crate::live::resolve_destination(&url)
+            .and_then(|(url, key)| crate::live::start_output(&url, &key));
         match r {
             Ok(o) => {
                 self.st.stream_id = Some(self.st.live.add_output(o));
@@ -609,9 +721,12 @@ impl App {
     fn sync_preview(&mut self) {
         // The replay buffer and streams keep a session running while the
         // window is closed.
-        let want = (self.main_visible || self.live_wanted()) && self.st.recording.is_none() && !self.st.finishing;
+        let want = (self.main_visible || self.live_wanted())
+            && self.st.recording.is_none()
+            && !self.st.finishing;
         // Overlay changes are applied live (`apply_pip`), not by restarting.
-        let stale = self.st.preview_settings.as_ref().map(Settings::capture_key) != Some(self.st.settings.capture_key());
+        let stale = self.st.preview_settings.as_ref().map(Settings::capture_key)
+            != Some(self.st.settings.capture_key());
         if self.st.preview.is_some() && (!want || stale) {
             if let Some(mut s) = self.st.preview.take() {
                 if want {
@@ -624,7 +739,10 @@ impl App {
         if want && self.st.preview.is_none() && self.st.error.is_none() {
             let cb = preview::callback(Arc::new(wake));
             let cam = self.st.spare_cam.take();
-            match self.options(None).and_then(|(o, t)| Session::start_with_camera(&o, t, false, Some(cb), cam)) {
+            match self
+                .options(None)
+                .and_then(|(o, t)| Session::start_with_camera(&o, t, false, Some(cb), cam))
+            {
                 Ok(s) => {
                     self.st.pip_applied = Some(self.st.settings.pip_spec());
                     self.st.preview = Some(s);
@@ -676,7 +794,10 @@ impl App {
             .and_then(|(o, t)| Session::start_with_camera(&o, t, true, Some(cb), cam));
         match r {
             Ok(sess) => {
-                let _ = std::fs::write(record::pidfile_path(), format!("{}\n{}\n", std::process::id(), file.display()));
+                let _ = std::fs::write(
+                    record::pidfile_path(),
+                    format!("{}\n{}\n", std::process::id(), file.display()),
+                );
                 self.st.pip_applied = Some(self.st.settings.pip_spec());
                 self.st.recording = Some(sess);
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
@@ -691,7 +812,9 @@ impl App {
     }
 
     fn stop_recording(&mut self) {
-        let Some(mut sess) = self.st.recording.take() else { return };
+        let Some(mut sess) = self.st.recording.take() else {
+            return;
+        };
         // The camera goes back to the preview once the file is finished.
         self.st.spare_cam = sess.take_camera();
         let file = sess.output.clone().unwrap_or_default();
@@ -762,7 +885,10 @@ impl App {
     fn tick(&mut self, el: &ActiveEventLoop) {
         // REC_SHOW_MENU: open the menu bar menu once, 3 s after launch
         // (for screenshots). It tracks modally until dismissed.
-        if !self.menu_shown && std::env::var_os("REC_SHOW_MENU").is_some() && self.launched.elapsed() > Duration::from_secs(3) {
+        if !self.menu_shown
+            && std::env::var_os("REC_SHOW_MENU").is_some()
+            && self.launched.elapsed() > Duration::from_secs(3)
+        {
             self.menu_shown = true;
             if let Some(m) = &self.menubar {
                 m.pop_up();
@@ -797,13 +923,23 @@ impl App {
         for c in cmds.into_iter().chain(ui_cmds) {
             self.handle(el, c);
         }
-        let (finished, running): (Vec<_>, Vec<_>) = self.st.replay_saves.drain(..).partition(|h| h.is_finished());
+        let (finished, running): (Vec<_>, Vec<_>) = self
+            .st
+            .replay_saves
+            .drain(..)
+            .partition(|h| h.is_finished());
         self.st.replay_saves = running;
         for h in finished {
             match h.join() {
                 Ok(Ok(p)) => {
                     eprintln!("rec: replay saved {}", p.display());
-                    self.st.notice = Some((format!("Replay saved: {}", p.file_name().unwrap_or_default().to_string_lossy()), Instant::now()));
+                    self.st.notice = Some((
+                        format!(
+                            "Replay saved: {}",
+                            p.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        Instant::now(),
+                    ));
                     self.st.last_file = Some(p);
                 }
                 Ok(Err(e)) => self.st.error = Some(format!("Replay: {e:#}")),
@@ -820,12 +956,22 @@ impl App {
         }
         let failed = self.st.recording.as_ref().is_some_and(|s| s.failed());
         if failed {
-            let err = self.st.recording.as_ref().and_then(|s| s.error()).unwrap_or_default();
+            let err = self
+                .st
+                .recording
+                .as_ref()
+                .and_then(|s| s.error())
+                .unwrap_or_default();
             self.stop_recording();
             self.st.error = Some(format!("Recording stopped: {err}"));
         }
         if self.st.preview.as_ref().is_some_and(|s| s.failed()) {
-            let err = self.st.preview.as_ref().and_then(|s| s.error()).unwrap_or_default();
+            let err = self
+                .st
+                .preview
+                .as_ref()
+                .and_then(|s| s.error())
+                .unwrap_or_default();
             if let Some(s) = self.st.preview.take() {
                 let _ = s.finish();
             }
@@ -878,8 +1024,17 @@ impl App {
             // avoids a blur when the area is mid-resize.
             let filter = wgpu::FilterMode::Nearest;
             match self.st.preview_tex {
-                Some(id) => w.renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &view, filter, id),
-                None => self.st.preview_tex = Some(w.renderer.register_native_texture(&gpu.device, &view, filter)),
+                Some(id) => {
+                    w.renderer
+                        .update_egui_texture_from_wgpu_texture(&gpu.device, &view, filter, id)
+                }
+                None => {
+                    self.st.preview_tex = Some(w.renderer.register_native_texture(
+                        &gpu.device,
+                        &view,
+                        filter,
+                    ))
+                }
             }
             self.preview_textures.push_back(f.texture);
             while self.preview_textures.len() > 2 {
@@ -887,7 +1042,11 @@ impl App {
             }
             self.st.frames_shown += 1;
         }
-        let win = if is_main { self.main.as_mut() } else { self.settings_win.as_mut() };
+        let win = if is_main {
+            self.main.as_mut()
+        } else {
+            self.settings_win.as_mut()
+        };
         let Some(win) = win else { return };
         let input = win.egui.take_egui_input(&win.window);
         let st = &mut self.st;
@@ -898,9 +1057,17 @@ impl App {
                 ui::settings_window(ui, st);
             }
         });
-        win.egui.handle_platform_output(&win.window, out.platform_output);
-        let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map_or(Duration::MAX, |v| v.repaint_delay);
-        win.repaint_at = if delay < Duration::from_secs(60) { Some(Instant::now() + delay) } else { None };
+        win.egui
+            .handle_platform_output(&win.window, out.platform_output);
+        let delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
+        win.repaint_at = if delay < Duration::from_secs(60) {
+            Some(Instant::now() + delay)
+        } else {
+            None
+        };
         let ppp = out.pixels_per_point;
         let prims = win.ctx.tessellate(out.shapes, ppp);
         // Upload every frame, even when the surface frame is skipped, or a
@@ -911,7 +1078,8 @@ impl App {
             }
         }
         let frame = match win.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => {
                 win.surface.configure(&gpu.device, &win.config);
                 for id in &out.textures_delta.free {
@@ -923,9 +1091,14 @@ impl App {
         let (x, y) = theme::TRAFFIC_LIGHTS;
         macos::inset_traffic_lights(&win.window, x, y);
         let view = frame.texture.create_view(&Default::default());
-        let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [win.config.width, win.config.height], pixels_per_point: ppp };
+        let sd = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [win.config.width, win.config.height],
+            pixels_per_point: ppp,
+        };
         let mut enc = gpu.device.create_command_encoder(&Default::default());
-        let extra = win.renderer.update_buffers(&gpu.device, &gpu.queue, &mut enc, &prims, &sd);
+        let extra = win
+            .renderer
+            .update_buffers(&gpu.device, &gpu.queue, &mut enc, &prims, &sd);
         {
             let bg = theme::palette(win.ctx.theme() == egui::Theme::Dark).window;
             let [r, g, b, _] = bg.to_normalized_gamma_f32();
@@ -937,7 +1110,12 @@ impl App {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: r as f64,
+                                g: g as f64,
+                                b: b as f64,
+                                a: 1.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -969,11 +1147,16 @@ impl ApplicationHandler for App {
         }
         let mtm = objc2::MainThreadMarker::new().expect("main thread");
         let mb = menubar::MenuBar::new(mtm);
-        let ok = crate::hotkey::register(HOTKEY_RECORD, crate::hotkey::KEY_R, crate::hotkey::CMD | crate::hotkey::SHIFT, || {
-            push(Cmd::ToggleRecording)
-        });
+        let ok = crate::hotkey::register(
+            HOTKEY_RECORD,
+            crate::hotkey::KEY_R,
+            crate::hotkey::CMD | crate::hotkey::SHIFT,
+            || push(Cmd::ToggleRecording),
+        );
         if let Err(code) = ok {
-            eprintln!("rec: could not register ⇧⌘R (error {code}); use the menu or the window instead");
+            eprintln!(
+                "rec: could not register ⇧⌘R (error {code}); use the menu or the window instead"
+            );
             mb.hotkey_unavailable();
             self.st.hotkey_ok = false;
         }
@@ -1006,7 +1189,11 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == id);
-        let win = if is_main { self.main.as_mut() } else { self.settings_win.as_mut() };
+        let win = if is_main {
+            self.main.as_mut()
+        } else {
+            self.settings_win.as_mut()
+        };
         let Some(win) = win else { return };
         let resp = win.egui.on_window_event(&win.window, &event);
         match event {
@@ -1061,12 +1248,18 @@ impl ApplicationHandler for App {
         }
         // Animate while capturing (preview, meters, timer); otherwise idle
         // with a slow tick for signals.
-        let live = self.st.recording.is_some() || self.st.preview.is_some() || self.st.finishing || self.st.stream_id.is_some();
+        let live = self.st.recording.is_some()
+            || self.st.preview.is_some()
+            || self.st.finishing
+            || self.st.stream_id.is_some();
         let now = Instant::now();
         let mut next = now + Duration::from_millis(if live { 100 } else { 250 });
         // The occlusion event only reports changes (not a window created
         // while the screen is locked): ask AppKit each pass.
-        for (w, main) in [(self.main.as_mut(), true), (self.settings_win.as_mut(), false)] {
+        for (w, main) in [
+            (self.main.as_mut(), true),
+            (self.settings_win.as_mut(), false),
+        ] {
             if let Some(w) = w {
                 let o = macos::is_occluded(&w.window);
                 if o != w.occluded {
@@ -1077,7 +1270,10 @@ impl ApplicationHandler for App {
                 }
             }
         }
-        for w in [self.main.as_mut(), self.settings_win.as_mut()].into_iter().flatten() {
+        for w in [self.main.as_mut(), self.settings_win.as_mut()]
+            .into_iter()
+            .flatten()
+        {
             let visible = w.window.is_visible().unwrap_or(true) && !w.occluded;
             if live && visible {
                 // Timer, meters: ~15 fps; preview frames wake us on arrival.
@@ -1109,7 +1305,11 @@ struct SelfTest {
 
 impl SelfTest {
     fn step(&mut self, app: &mut App) {
-        let t = self.t0.get_or_insert_with(Instant::now).elapsed().as_secs_f64();
+        let t = self
+            .t0
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_secs_f64();
         // REC_GUI_SELFTEST=terminate: quit the way the Dock does
         // (-[NSApp terminate:]) mid-recording; the file must be finalized.
         if std::env::var("REC_GUI_SELFTEST").as_deref() == Ok("terminate") {
@@ -1119,7 +1319,10 @@ impl SelfTest {
                     self.step = 1;
                 }
                 1 if t > 5.0 => {
-                    println!("selftest: recording={} -> NSApp terminate:", app.st.recording.is_some());
+                    println!(
+                        "selftest: recording={} -> NSApp terminate:",
+                        app.st.recording.is_some()
+                    );
                     let mtm = objc2::MainThreadMarker::new().unwrap();
                     objc2_app_kit::NSApplication::sharedApplication(mtm).terminate(None);
                     self.step = 2;
@@ -1143,7 +1346,10 @@ impl SelfTest {
                 }
                 1 if t > 4.0 => {
                     app.hide_main();
-                    println!("selftest: window hidden, live session={}", app.st.preview.is_some());
+                    println!(
+                        "selftest: window hidden, live session={}",
+                        app.st.preview.is_some()
+                    );
                     push(Cmd::ToggleRecording);
                     self.step = 2;
                 }
@@ -1152,13 +1358,20 @@ impl SelfTest {
                     self.step = 3;
                 }
                 3 if t > 9.0 && !app.st.finishing => {
-                    println!("selftest: after recording live session={} saved={:?}", app.st.preview.is_some(), app.st.last_file);
+                    println!(
+                        "selftest: after recording live session={} saved={:?}",
+                        app.st.preview.is_some(),
+                        app.st.last_file
+                    );
                     push(Cmd::SaveReplay);
                     self.step = 4;
                 }
                 4 if app.st.notice.is_some() || app.st.error.is_some() || t > 25.0 => {
                     let held = app.st.replay_stats.map_or(0.0, |r| r.0);
-                    println!("selftest: replay saved={:?} held={held:.1}s error={:?}", app.st.last_file, app.st.error);
+                    println!(
+                        "selftest: replay saved={:?} held={held:.1}s error={:?}",
+                        app.st.last_file, app.st.error
+                    );
                     if let Some(s) = &app.st.stream_status {
                         println!(
                             "selftest: stream live={} state={} bitrate={:.1}Mb/s dropped={} reconnects={}",
@@ -1178,13 +1391,21 @@ impl SelfTest {
         }
         match self.step {
             0 if t > 3.0 => {
-                println!("selftest: idle preview session={} frame_shown={}", app.st.preview.is_some(), app.st.frames_shown > 0);
+                println!(
+                    "selftest: idle preview session={} frame_shown={}",
+                    app.st.preview.is_some(),
+                    app.st.frames_shown > 0
+                );
                 app.st.frames_shown = 0;
                 push(Cmd::ToggleRecording);
                 self.step = 1;
             }
             1 if t > 4.0 => {
-                println!("selftest: recording={} error={:?}", app.st.recording.is_some(), app.st.error);
+                println!(
+                    "selftest: recording={} error={:?}",
+                    app.st.recording.is_some(),
+                    app.st.error
+                );
                 push(Cmd::TogglePause);
                 self.step = 2;
             }
@@ -1194,18 +1415,27 @@ impl SelfTest {
                 self.step = 3;
             }
             3 if t > 8.0 => {
-                println!("selftest: preview during recording frame_shown={}", app.st.frames_shown > 0);
+                println!(
+                    "selftest: preview during recording frame_shown={}",
+                    app.st.frames_shown > 0
+                );
                 println!(
                     "selftest: status title={:?} recorded={:.2}s wall={:.2}s",
                     app.menubar.as_ref().and_then(|m| m.title()),
                     app.st.recording.as_ref().map_or(0.0, |s| s.recorded_secs()),
-                    app.st.recording.as_ref().map_or(0.0, |s| s.started.elapsed().as_secs_f64())
+                    app.st
+                        .recording
+                        .as_ref()
+                        .map_or(0.0, |s| s.started.elapsed().as_secs_f64())
                 );
                 push(Cmd::ToggleRecording);
                 self.step = 4;
             }
             4 if !app.st.finishing && app.st.recording.is_none() => {
-                println!("selftest: saved={:?} error={:?}", app.st.last_file, app.st.error);
+                println!(
+                    "selftest: saved={:?} error={:?}",
+                    app.st.last_file, app.st.error
+                );
                 push(Cmd::ShowSettings);
                 self.step = 5;
             }
@@ -1229,7 +1459,10 @@ impl SelfTest {
                     app.st.preview.is_some()
                 );
                 app.hide_main();
-                println!("selftest: after close preview_session={}", app.st.preview.is_some());
+                println!(
+                    "selftest: after close preview_session={}",
+                    app.st.preview.is_some()
+                );
                 push(Cmd::Quit);
                 self.step = 7;
             }
