@@ -86,6 +86,8 @@ pub struct Options {
     pub bitrate: u64,
     pub system_audio: bool,
     pub mic: Option<Option<String>>,
+    /// Set when the requested mic isn't connected and the default is used.
+    pub mic_warning: Option<String>,
     pub webcam: Option<Option<String>>,
     pub pip: PipSpec,
     pub cursor: bool,

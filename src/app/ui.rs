@@ -444,6 +444,24 @@ fn meter(ui: &mut Ui, label: &str, m: Meter, on: bool) {
     });
 }
 
+/// Mic choices; a saved mic that isn't connected stays listed as such.
+fn mic_options(st: &State, s: &Settings) -> Vec<(Option<String>, String)> {
+    let mut mics: Vec<(Option<String>, String)> = vec![(None, "Default microphone".into())];
+    mics.extend(st.mics.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
+    if let Some(id) = &s.mic
+        && !st.mics.iter().any(|d| &d.id == id)
+    {
+        let name = s.mic_name.clone().unwrap_or_else(|| id.clone());
+        mics.push((Some(id.clone()), format!("{name} (not connected)")));
+    }
+    mics
+}
+
+/// Display name of the chosen mic (None for the system default).
+fn mic_label(mics: &[(Option<String>, String)], id: &Option<String>) -> Option<String> {
+    id.as_ref().and(mics.iter().find(|(v, _)| v == id).map(|(_, l)| l.trim_end_matches(" (not connected)").to_string()))
+}
+
 fn combo<T: Clone + PartialEq>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, String)], enabled: bool) -> bool {
     let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| l.clone()).unwrap_or_default();
     let mut changed = false;
@@ -521,9 +539,10 @@ fn sources(ui: &mut Ui, st: &mut State) {
     section(ui, "AUDIO");
     ui.add_enabled(idle, egui::Checkbox::new(&mut s.system_audio, "System audio"));
     ui.add_enabled(idle, egui::Checkbox::new(&mut s.mic_enabled, "Microphone"));
-    let mut mics: Vec<(Option<String>, String)> = vec![(None, "Default microphone".into())];
-    mics.extend(st.mics.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
-    combo(ui, "mic", &mut s.mic, &mics, idle && s.mic_enabled);
+    let mics = mic_options(st, &s);
+    if combo(ui, "mic", &mut s.mic, &mics, idle && s.mic_enabled) {
+        s.mic_name = mic_label(&mics, &s.mic);
+    }
 
     section(ui, "OUTPUT");
     let codec = s.codec.map_or("Auto codec".to_string(), |c| format!("{c:?}").replace("H264", "H.264").replace("Hevc", "HEVC").replace("Prores", "ProRes 422"));
@@ -733,11 +752,12 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         ui.checkbox(&mut s.system_audio, "Record");
         ui.end_row();
         ui.label("Microphone");
-        let mut mics: Vec<(Option<String>, String)> = vec![(None, "Default microphone".into())];
-        mics.extend(st.mics.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
+        let mics = mic_options(st, &s);
         ui.horizontal(|ui| {
             ui.checkbox(&mut s.mic_enabled, "");
-            combo(ui, "mic2", &mut s.mic, &mics, s.mic_enabled);
+            if combo(ui, "mic2", &mut s.mic, &mics, s.mic_enabled) {
+                s.mic_name = mic_label(&mics, &s.mic);
+            }
         });
         ui.end_row();
         ui.label("Tracks");

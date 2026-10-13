@@ -138,6 +138,10 @@ pub struct RecordArgs {
     /// (default: the system default mic).
     #[arg(long, value_name = "DEVICE")]
     mic: Option<String>,
+    /// Display name of the --mic device, used to find it again when its
+    /// unique ID changed.
+    #[arg(long, hide = true, value_name = "NAME")]
+    mic_name: Option<String>,
     /// Do not record the microphone.
     #[arg(long, conflicts_with = "mic")]
     no_mic: bool,
@@ -369,10 +373,19 @@ fn default_output() -> PathBuf {
 /// Turn record arguments into session options and a capture target
 /// (shared by the CLI and the GUI).
 pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>)> {
+    // A missing mic falls back to the default; audio never blocks a session.
+    let mut mic_warning = None;
     let mic = if a.no_mic {
         None
     } else {
-        Some(a.mic.as_deref().filter(|m| *m != "default").map(camera::resolve_mic).transpose()?)
+        Some(a.mic.as_deref().filter(|m| *m != "default").and_then(|sel| {
+            let p = camera::pick_mic(sel, a.mic_name.as_deref());
+            if let Some(w) = p.warning {
+                eprintln!("rec: warning: {w}");
+                mic_warning = Some(w);
+            }
+            p.id
+        }))
     };
     let mut webcam = a.webcam.map(|s| if s.is_empty() || s == "default" { None } else { Some(s) });
     let scene = a.scene.unwrap_or(if webcam.is_some() { compose::Scene::ScreenCam } else { compose::Scene::Screen });
@@ -388,6 +401,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         bitrate: 0,
         system_audio: !a.no_system_audio,
         mic,
+        mic_warning,
         webcam,
         pip: PipSpec {
             size: a.pip_size.clamp(0.05, 0.9),

@@ -62,18 +62,67 @@ pub fn microphones() -> Vec<Device> {
     }
 }
 
-/// Resolve a user-supplied mic selector (unique ID, or case-insensitive name
-/// substring) to a unique ID.
-pub fn resolve_mic(sel: &str) -> Result<String> {
+/// A saved or requested mic resolved against the connected devices.
+pub struct MicPick {
+    /// Unique ID to open; None = the system default mic.
+    pub id: Option<String>,
+    /// Why the requested mic wasn't used (it is not connected).
+    pub warning: Option<String>,
+}
+
+/// Resolve a mic selector without failing: by unique ID, then by name, then
+/// the system default with a warning. Audio never blocks a session.
+pub fn pick_mic(sel: &str, name: Option<&str>) -> MicPick {
     let mics = microphones();
-    if let Some(m) = mics.iter().find(|m| m.id == sel) {
-        return Ok(m.id.clone());
+    match match_mic(&mics, sel, name) {
+        Some(id) => MicPick { id: Some(id), warning: None },
+        None => {
+            let label = name.filter(|n| !n.is_empty()).unwrap_or(sel);
+            MicPick { id: None, warning: Some(format!("Microphone \u{201c}{label}\u{201d} not connected; using the default mic")) }
+        }
     }
-    let lower = sel.to_lowercase();
-    mics.iter()
-        .find(|m| m.name.to_lowercase().contains(&lower))
-        .map(|m| m.id.clone())
-        .ok_or_else(|| anyhow!("no microphone matches {sel:?} (see `rec-rs devices`)"))
+}
+
+fn match_mic(mics: &[Device], sel: &str, name: Option<&str>) -> Option<String> {
+    // Exact unique ID.
+    if let Some(m) = mics.iter().find(|m| m.id == sel) {
+        return Some(m.id.clone());
+    }
+    // USB unique IDs end in a port/instance index (`…:SERIAL:4`) that can
+    // change between plugs; match on the rest.
+    let stem = |id: &str| id.rsplit_once(':').filter(|(_, n)| n.chars().all(|c| c.is_ascii_digit())).map(|(s, _)| s.to_string());
+    if let Some(st) = stem(sel)
+        && let Some(m) = mics.iter().find(|m| stem(&m.id).as_deref() == Some(st.as_str()))
+    {
+        return Some(m.id.clone());
+    }
+    // Saved display name (exact, then substring), then the selector as a name.
+    for n in name.into_iter().chain([sel]).filter(|n| !n.is_empty()) {
+        let lower = n.to_lowercase();
+        if let Some(m) = mics.iter().find(|m| m.name.to_lowercase() == lower) {
+            return Some(m.id.clone());
+        }
+        if let Some(m) = mics.iter().find(|m| m.name.to_lowercase().contains(&lower)) {
+            return Some(m.id.clone());
+        }
+    }
+    None
+}
+
+/// Call `f` on the main queue whenever a capture device is connected or
+/// disconnected. The observers live for the process.
+pub fn on_device_change(f: impl Fn() + Clone + 'static) {
+    use objc2_foundation::{NSNotification, NSNotificationCenter, NSOperationQueue};
+    unsafe {
+        let center = NSNotificationCenter::defaultCenter();
+        let queue = NSOperationQueue::mainQueue();
+        for name in [AVCaptureDeviceWasConnectedNotification, AVCaptureDeviceWasDisconnectedNotification] {
+            let f = f.clone();
+            let block = block2::RcBlock::new(move |_n: std::ptr::NonNull<NSNotification>| f());
+            let token = center.addObserverForName_object_queue_usingBlock(Some(name), None, Some(&queue), &block);
+            std::mem::forget(token);
+        }
+    }
 }
 
 pub struct CamIvars {
@@ -274,5 +323,27 @@ impl Mic {
 
     pub fn stop(&self) {
         unsafe { self.session.stopRunning() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(id: &str, name: &str) -> Device {
+        Device { id: id.into(), name: name.into() }
+    }
+
+    #[test]
+    fn mic_matching() {
+        let mics = [dev("BuiltInMicrophoneDevice", "MacBook Pro Microphone"), dev("AppleUSBAudioEngine:DJI:DJIPocket3:123456789ABCDEF:2", "OsmoPocket3")];
+        let dji = Some("AppleUSBAudioEngine:DJI:DJIPocket3:123456789ABCDEF:2".to_string());
+        // Same device on another port.
+        assert_eq!(match_mic(&mics, "AppleUSBAudioEngine:DJI:DJIPocket3:123456789ABCDEF:4", None), dji);
+        // By saved name.
+        assert_eq!(match_mic(&mics, "gone-id", Some("OsmoPocket3")), dji);
+        // By name substring (CLI).
+        assert_eq!(match_mic(&mics, "macbook", None).as_deref(), Some("BuiltInMicrophoneDevice"));
+        assert_eq!(match_mic(&mics[..1], "AppleUSBAudioEngine:DJI:DJIPocket3:123456789ABCDEF:4", Some("OsmoPocket3")), None);
     }
 }

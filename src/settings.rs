@@ -34,6 +34,8 @@ pub struct Settings {
     pub mic_enabled: bool,
     /// Microphone unique ID; None = system default.
     pub mic: Option<String>,
+    /// The mic's display name, to find it again if its unique ID changes.
+    pub mic_name: Option<String>,
     pub system_audio: bool,
     pub audio_tracks: AudioLayout,
     pub system_gain_db: f32,
@@ -88,6 +90,7 @@ impl Default for Settings {
             camera: None,
             mic_enabled: true,
             mic: None,
+            mic_name: None,
             system_audio: true,
             audio_tracks: AudioLayout::Both,
             system_gain_db: 0.0,
@@ -286,6 +289,9 @@ impl Settings {
             a.push("--no-mic".into());
         } else if let Some(m) = &self.mic {
             a.extend(["--mic".into(), m.clone()]);
+            if let Some(n) = &self.mic_name {
+                a.extend(["--mic-name".into(), n.clone()]);
+            }
         }
         if !self.system_audio {
             a.push("--no-system-audio".into());

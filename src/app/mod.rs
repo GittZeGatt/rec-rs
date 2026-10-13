@@ -51,6 +51,8 @@ const HOTKEY_REPLAY: u32 = 2;
 
 static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
 static PROXY: OnceLock<Mutex<EventLoopProxy<()>>> = OnceLock::new();
+/// A capture device was plugged in or removed.
+static DEVICES_CHANGED: AtomicBool = AtomicBool::new(false);
 
 /// REC_GUI_BACKGROUND: open windows without taking focus from the app in
 /// use (scripted runs and screenshots while someone works).
@@ -177,6 +179,10 @@ pub struct State {
     pub key_saved: Option<(String, bool)>,
     /// A short confirmation (replay saved) and when it was shown.
     pub notice: Option<(String, Instant)>,
+    /// The mic the running session opened (None = system default), and the
+    /// device fallback warning last shown, so it isn't repeated on restarts.
+    mic_in_use: Option<Option<String>>,
+    mic_warned: Option<String>,
 }
 
 impl State {
@@ -326,9 +332,15 @@ impl App {
             stream_key_input: String::new(),
             key_saved: None,
             notice: None,
+            mic_in_use: None,
+            mic_warned: None,
         };
         st.live.set_config(st.settings.live_config());
         load_devices(&mut st);
+        crate::camera::on_device_change(|| {
+            DEVICES_CHANGED.store(true, Ordering::SeqCst);
+            wake();
+        });
         App {
             gpu: None,
             main: None,
@@ -481,12 +493,46 @@ impl App {
         }
     }
 
-    fn options(&self, output: Option<&std::path::Path>) -> Result<(record::Options, Option<crate::screen::Target>)> {
-        let args = self.st.settings.record_args(output);
+    fn options(&mut self, output: Option<&std::path::Path>) -> Result<(record::Options, Option<crate::screen::Target>)> {
+        // A display that was unplugged falls back to the main one.
+        let mut settings = self.st.settings.clone();
+        let mut warning = None;
+        let count = crate::screen::displays().map(|d| d.len()).unwrap_or(0);
+        if count > 0 && settings.window.is_none() && settings.display > count {
+            warning = Some(format!("Display {} not connected; using display 1", settings.display));
+            settings.display = 1;
+            eprintln!("rec: warning: {}", warning.as_deref().unwrap_or_default());
+        }
+        let args = settings.record_args(output);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (mut o, t) = crate::prepare(crate::parse_record_args(&refs)?)?;
         o.live = Some(self.st.live.clone());
+        // Fallbacks never block: say so once.
+        let warning = [warning, o.mic_warning.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        let warning = Some(warning).filter(|w| !w.is_empty());
+        if warning != self.st.mic_warned {
+            if let Some(w) = &warning {
+                self.st.notice = Some((w.clone(), Instant::now()));
+            }
+            self.st.mic_warned = warning;
+        }
+        self.st.mic_in_use = o.mic.clone();
         Ok((o, t))
+    }
+
+    /// After a device was plugged in or removed: refresh the lists, and
+    /// restart the preview if the saved mic now resolves differently.
+    fn devices_changed(&mut self) {
+        load_devices(&mut self.st);
+        let s = &self.st.settings;
+        let Some(sel) = s.mic.as_deref().filter(|_| s.mic_enabled) else { return };
+        if self.st.recording.is_some() || self.st.preview.is_none() {
+            return;
+        }
+        let want = Some(crate::camera::pick_mic(sel, s.mic_name.as_deref()).id);
+        if self.st.mic_in_use != want {
+            self.st.preview_settings = None;
+        }
     }
 
     /// Whether the live encode needs a capture session (replay or stream).
@@ -788,6 +834,9 @@ impl App {
         if self.st.refresh_devices {
             self.st.refresh_devices = false;
             load_devices(&mut self.st);
+        }
+        if DEVICES_CHANGED.swap(false, Ordering::SeqCst) {
+            self.devices_changed();
         }
         // Meters.
         let dt = self.last_meter.elapsed().as_secs_f32();
